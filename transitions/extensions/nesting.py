@@ -160,6 +160,7 @@ class NestedEventData(EventData):
         super(NestedEventData, self).__init__(state, event, machine, model, args, kwargs)
         self.source_path = None
         self.source_name = None
+        self.history_override = None
 
 
 class NestedState(State):
@@ -233,12 +234,73 @@ class NestedState(State):
         return self.separator.join(self._scope + [super(NestedState, self).name])
 
 
+class HistoryState(NestedState):
+    """A pseudo-state which remembers the configuration of its parent state when the parent is exited.
+        Targeting a history state with a transition re-enters the parent state with the remembered
+        configuration instead of its initial one. History is tracked for each model individually which
+        means models of the same machine do not share (or overwrite) each other's history.
+        The pseudo-state itself is never entered and does not show up in a model's state.
+    Attributes:
+        default (str, Enum or list): (Name of a) child of the parent state that should be entered when
+        no history has been recorded yet. A list can be passed to target multiple (parallel) regions.
+        Names containing the state separator are considered paths to more deeply nested states.
+        If no default is configured, the parent is entered with its own initial configuration.
+    """
+
+    deep = False
+    """Whether the entire active subtree (True) or only the direct children (False) are remembered."""
+
+    def __init__(self, name, default=None, **kwargs):
+        super(HistoryState, self).__init__(name, **kwargs)
+        self.default = default
+
+    def build_default_spec(self):
+        """Converts the configured default target(s) into a state (sub)tree specification.
+        Returns:
+            OrderedDict or None: A tree of state names where children marked with None are entered
+            with their own initial configuration. None when no default has been configured.
+        """
+        if self.default is None:
+            return None
+        spec = OrderedDict()
+        for target in listify(self.default):
+            path = target.split(self.separator) if isinstance(target, string_types) else [target.name]
+            branch = spec
+            for elem in path[:-1]:
+                node = branch.get(elem)
+                if not isinstance(node, dict):
+                    node = branch[elem] = OrderedDict()
+                branch = node
+            if path[-1] not in branch:
+                branch[path[-1]] = None
+        return spec
+
+
+class ShallowHistory(HistoryState):
+    """A pseudo-state which only remembers the direct children of its parent state. More deeply
+        nested states are entered with their initial configuration."""
+
+
+class DeepHistory(HistoryState):
+    """A pseudo-state which remembers the entire active subtree of its parent state including
+        the configuration of parallel regions."""
+
+    deep = True
+
+
 class NestedTransition(Transition):
     """A transition which handles entering and leaving nested states."""
 
     def _resolve_transition(self, event_data):
-        dst_name_path = self.dest.split(event_data.machine.state_cls.separator)
-        _ = event_data.machine.get_state(dst_name_path)
+        machine = event_data.machine
+        separator = machine.state_cls.separator
+        dst_name_path = self.dest.split(separator)
+        dest_state = machine.get_state(dst_name_path)
+        history_state = dest_state if isinstance(dest_state, HistoryState) else None
+        if history_state is not None:
+            # a history pseudo-state is never entered itself; the transition targets its parent
+            history_key = separator.join(dst_name_path)
+            dst_name_path.pop()
         state_tree = event_data.machine.build_state_tree(
             listify(getattr(event_data.model, event_data.machine.model_attribute)),
             event_data.machine.state_cls.separator)
@@ -265,9 +327,20 @@ class NestedTransition(Transition):
         else:
             exit_scope = scoped_tree
 
+        # remember the active configuration of exited states with history children before
+        # the state tree is altered; internal transitions never reach this point
+        machine._record_history(event_data, scope + root, exit_scope)
+
         exit_partials = [partial(event_data.machine.get_state(root + state_name).scoped_exit,
                                  event_data, scope + root + state_name[:-1])
                          for state_name in resolve_order(exit_scope)]
+
+        if history_state is not None:
+            spec = machine._get_history_store(event_data.model).get(history_key)
+            if spec is None:
+                spec = history_state.build_default_spec()
+            if spec:
+                event_data.history_override = (scope + root + dst_name_path, spec)
 
         new_states, enter_partials = self._enter_nested(root, dst_name_path, scope + root, event_data)
 
@@ -336,29 +409,67 @@ class NestedTransition(Transition):
                 new_states[state_name], new_enter = self._enter_nested([], dest, prefix_path + [state_name], event_data)
                 enter_partials = [partial(event_data.machine.scoped.scoped_enter, event_data, prefix_path)] + new_enter
             return new_states, enter_partials
-        elif event_data.machine.scoped.initial:
-            new_states = OrderedDict()
-            enter_partials = []
-            queue = []
-            prefix = prefix_path
-            scoped_tree = new_states
-            initial_names = [i.name if hasattr(i, 'name') else i for i in listify(event_data.machine.scoped.initial)]
-            initial_states = [event_data.machine.scoped.states[n] for n in initial_names]
-            while True:
-                event_data.scope = prefix
-                for state in initial_states:
-                    enter_partials.append(partial(state.scoped_enter, event_data, prefix))
-                    scoped_tree[state.name] = OrderedDict()
-                    if state.initial:
-                        queue.append((scoped_tree[state.name], prefix + [state.name],
-                                     [state.states[i.name] if hasattr(i, 'name') else state.states[i]
-                                     for i in listify(state.initial)]))
-                if not queue:
-                    break
-                scoped_tree, prefix, initial_states = queue.pop(0)
-            return new_states, enter_partials
         else:
+            # when a history pseudo-state has been targeted, enter the remembered (or default)
+            # configuration instead of the parent's initial one
+            override = getattr(event_data, 'history_override', None)
+            if override is not None and override[0] == prefix_path:
+                event_data.history_override = None
+                return self._enter_history(override[1], prefix_path, event_data)
+            if event_data.machine.scoped.initial:
+                new_states = OrderedDict()
+                enter_partials = []
+                queue = []
+                prefix = prefix_path
+                scoped_tree = new_states
+                initial_names = [i.name if hasattr(i, 'name') else i
+                                 for i in listify(event_data.machine.scoped.initial)]
+                initial_states = [event_data.machine.scoped.states[n] for n in initial_names]
+                while True:
+                    event_data.scope = prefix
+                    for state in initial_states:
+                        enter_partials.append(partial(state.scoped_enter, event_data, prefix))
+                        scoped_tree[state.name] = OrderedDict()
+                        if state.initial:
+                            queue.append((scoped_tree[state.name], prefix + [state.name],
+                                         [state.states[i.name] if hasattr(i, 'name') else state.states[i]
+                                         for i in listify(state.initial)]))
+                    if not queue:
+                        break
+                    scoped_tree, prefix, initial_states = queue.pop(0)
+                return new_states, enter_partials
             return {}, []
+
+    def _enter_history(self, spec, prefix_path, event_data):
+        """Builds the state tree and enter callbacks for a history specification.
+        Args:
+            spec (OrderedDict): A tree of state names to enter. Children marked with None are
+                entered with their own initial configuration (shallow history).
+            prefix_path (list(str)): Global path of the history state's parent.
+            event_data (NestedEventData): The currently processed event.
+        Returns:
+            tuple of OrderedDict and list of partials to be called to enter the states.
+        """
+        machine = event_data.machine
+        new_states = OrderedDict()
+        enter_partials = []
+        queue = [(new_states, prefix_path, spec)]
+        while queue:
+            scoped_tree, prefix, current_spec = queue.pop(0)
+            event_data.scope = prefix
+            for state_name, sub_spec in current_spec.items():
+                state = machine.get_state(prefix + [state_name])
+                enter_partials.append(partial(state.scoped_enter, event_data, prefix))
+                scoped_tree[state_name] = OrderedDict()
+                if sub_spec is None:
+                    # shallow history or default target: enter the state's initial configuration
+                    if state.initial:
+                        initial_spec = OrderedDict((i.name if hasattr(i, 'name') else i, None)
+                                                   for i in listify(state.initial))
+                        queue.append((scoped_tree[state_name], prefix + [state_name], initial_spec))
+                elif sub_spec:
+                    queue.append((scoped_tree[state_name], prefix + [state_name], sub_spec))
+        return new_states, enter_partials
 
     @staticmethod
     def _update_model(event_data, tree):
@@ -407,6 +518,9 @@ class HierarchicalMachine(Machine):
         self.prefix_path = []
         self.scoped = self
         self._next_scope = None
+        # history is tracked for each model individually; the attribute name is unique to this
+        # machine to prevent machines that share a model from overwriting each other's history
+        self._history_attribute = '_history_{0:x}'.format(id(self))
         super(HierarchicalMachine, self).__init__(
             model=model, states=states, initial=initial, transitions=transitions,
             send_event=send_event, auto_transitions=auto_transitions,
@@ -525,6 +639,9 @@ class HierarchicalMachine(Machine):
             elif isinstance(state, NestedState):
                 if state.name in self.states:
                     raise ValueError("State {0} cannot be added since it already exists.".format(state.name))
+                if isinstance(state, HistoryState) and self.scoped is self:
+                    raise ValueError("History state {0} must be added as a child of another state."
+                                     .format(state.name))
                 self.states[state.name] = state
                 self._init_state(state)
             elif isinstance(state, HierarchicalMachine):
@@ -1075,6 +1192,43 @@ class HierarchicalMachine(Machine):
             for elem in path:
                 tmp = tmp.setdefault(elem.name if hasattr(elem, 'name') else elem, OrderedDict())
         return tree
+
+    def _get_history_store(self, model, create=False):
+        """Returns the dictionary that keeps the recorded history of the passed model.
+        Args:
+            model (object): The model whose history should be retrieved.
+            create (bool): Whether a store should be assigned to the model if none exists yet.
+        Returns:
+            dict: A mapping of global history state names to recorded state (sub)trees.
+        """
+        store = getattr(model, self._history_attribute, None)
+        if store is None:
+            store = {}
+            if create:
+                setattr(model, self._history_attribute, store)
+        return store
+
+    def _record_history(self, event_data, base_path, exit_scope):
+        """Remembers the active configuration of exited states that contain history pseudo-states.
+        Args:
+            event_data (NestedEventData): The currently processed event.
+            base_path (list(str)): Global path of the scope the exited states are defined in.
+            exit_scope (OrderedDict): The currently active (sub)tree of the exited states.
+        """
+        separator = self.state_cls.separator
+        for state_path in resolve_order(exit_scope):
+            state = self.get_state(base_path + state_path)
+            pseudo_states = [s for s in state.states.values() if isinstance(s, HistoryState)]
+            if not pseudo_states:
+                continue
+            subtree = reduce(dict.get, state_path, exit_scope)
+            store = self._get_history_store(event_data.model, create=True)
+            for pseudo in pseudo_states:
+                key = separator.join(base_path + state_path + [pseudo.name])
+                if pseudo.deep:
+                    store[key] = copy.deepcopy(subtree)
+                else:
+                    store[key] = OrderedDict((name, None) for name in subtree)
 
     def _get_enum_path(self, enum_state, prefix=None):
         prefix = prefix or []

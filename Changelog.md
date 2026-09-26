@@ -2,6 +2,7 @@
 
 ## 0.9.4 ()
 
+- Feature: `HierarchicalMachine` supports `ShallowHistory` and `DeepHistory` pseudo-states to restore the previously active configuration of a state when it is re-entered; history is tracked per model and internal transitions do not record history
 - Bug #688: `Machine.remove_transitions` did not work with `State` and `Enum` even though the signature implied this (thanks @hookokoko)
 - PR #696: Improve handling of `StrEnum` which were previously confused as string (thanks @jbrocher)
 - Bug #697: An empty string as a destination made a transition internal but only `dest=None` should do this (thanks @rudy-lath-vizio)

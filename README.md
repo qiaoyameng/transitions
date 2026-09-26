@@ -52,6 +52,7 @@ A lightweight, object-oriented state machine implementation in Python with many 
   - [Typing support](#typing-support)
   - [Extensions](#extensions)
     - [Hierarchical State Machine](#hsm)
+    - [History states](#history-states)
     - [Diagrams](#diagrams)
     - [Threading](#threading)
     - [Async](#async)
@@ -1772,6 +1773,49 @@ collector.collect()
 collector.count()
 collector.increase()
 assert collector.is_counting_2()
+```
+
+#### <a name="history-states"></a> History states
+
+When a state machine models something like a device that can be paused, re-entering a paused state should usually restore the configuration that was active before the pause instead of the state's `initial` configuration.
+`HierarchicalMachine` supports this with the pseudo-states `ShallowHistory` and `DeepHistory` from `transitions.extensions.nesting`.
+A history state is added as a child of the state whose configuration should be remembered and can be targeted by transitions like any other state.
+When its parent state is exited, the currently active configuration is recorded; when the history state is targeted later, the recorded configuration is restored.
+`ShallowHistory` only remembers the direct children of its parent (deeper nested states are entered with their `initial` configuration) while `DeepHistory` remembers the entire active subtree, including the configuration of parallel regions.
+History is recorded for each model individually, so models of the same machine do not share (or overwrite) each other's history.
+Internal transitions do not exit states and therefore do not record history.
+If no history has been recorded yet (e.g. the parent state has never been exited), the optional `default` target of the history state is entered; without a `default`, the parent's `initial` configuration is used.
+
+```python
+from transitions.extensions.nesting import HierarchicalMachine, ShallowHistory, DeepHistory
+
+states = [
+    'off',
+    'standby',
+    {'name': 'on', 'children': [
+        {'name': 'playback', 'children': ['paused', 'playing'], 'initial': 'paused'},
+        {'name': 'settings', 'children': ['audio', 'video'], 'initial': 'audio'},
+        ShallowHistory('H', default='settings')],  # try DeepHistory('H') instead
+     'initial': 'playback'},
+]
+
+transitions = [
+    ['power', 'off', 'on'],
+    ['pause', 'on', 'standby'],
+    ['resume', 'standby', 'on_H'],  # target the history pseudo-state of 'on'
+    ['play', 'on_playback_paused', 'on_playback_playing'],
+    ['tweak', 'on_playback', 'on_settings'],
+]
+
+device = HierarchicalMachine(states=states, transitions=transitions, initial='off')
+device.power()
+device.play()
+assert device.state == 'on_playback_playing'
+device.pause()
+device.resume()
+# ShallowHistory: back in 'playback' mode but with its initial substate
+assert device.state == 'on_playback_paused'
+# DeepHistory would have restored 'on_playback_playing' instead.
 ```
 
 #### <a name="diagrams"></a> Diagrams
