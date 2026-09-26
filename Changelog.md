@@ -2,6 +2,7 @@
 
 ## 0.9.4 ()
 
+- Feature: `Machine.modify_transitions` applies batches of `add`/`remove`/`replace` transition operations atomically; the whole batch is validated (state targets, duplicates, model method name conflicts, nested state paths) before anything is committed
 - Bug #688: `Machine.remove_transitions` did not work with `State` and `Enum` even though the signature implied this (thanks @hookokoko)
 - PR #696: Improve handling of `StrEnum` which were previously confused as string (thanks @jbrocher)
 - Bug #697: An empty string as a destination made a transition internal but only `dest=None` should do this (thanks @rudy-lath-vizio)

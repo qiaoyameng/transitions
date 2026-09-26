@@ -43,6 +43,7 @@ A lightweight, object-oriented state machine implementation in Python with many 
     - [Conditional transitions](#conditional-transitions)
     - [Check transitions](#check-transitions)
     - [Callbacks](#transition-callbacks)
+    - [Modifying transitions in batches](#batch-transitions)
   - [Callable resolution](#resolution)
   - [Callback execution order](#execution-order)
   - [Passing data](#passing-data)
@@ -941,6 +942,23 @@ print(lump.state)
 # >>> Fixing things ...
 # >>> initial
 ```
+
+#### <a name="batch-transitions"></a>Modifying transitions in batches
+
+Rule backends often need to change several transitions at once. `modify_transitions` applies a batch of `add`, `remove` and `replace` operations atomically: the whole batch is validated *before* anything is changed and only then committed to the machine. If any operation is invalid, a `ValueError` is raised and neither the transition table nor the convenience methods bound to your models are altered. Validation covers state targets (including nested state paths of `HierarchicalMachine`), duplicate transition definitions (within the batch and against the current table) and naming conflicts between new triggers and existing model attributes. No user callbacks (conditions, `before`/`after`, ...) are executed during validation or commit.
+
+```python
+machine.modify_transitions([
+    # add a new transition (conditions, before, after, ... can be passed as well)
+    {'op': 'add', 'trigger': 'reset', 'source': 'gas', 'dest': 'solid'},
+    # replace all transitions of 'melt' from 'solid' with the new definition
+    {'op': 'replace', 'trigger': 'melt', 'source': 'solid', 'dest': 'plasma'},
+    # remove matching transitions; 'source' and 'dest' default to '*'
+    {'op': 'remove', 'trigger': 'sublimate', 'source': 'solid'},
+])
+```
+
+When the last transition of a trigger is removed, the trigger and its dynamic model methods (including `may_<trigger>`) are removed as well. Events that are already being processed keep the consistent rule set that was in effect when they started; only events triggered after the commit observe the new rules. When events are processed concurrently by multiple threads, use `LockedMachine` (or `LockedHierarchicalMachine`): there, `modify_transitions` is serialized with event processing through the machine context, so a batch commit never interleaves with a running event and cannot deadlock with callback code. For `HierarchicalMachine`, batch operations are applied to the root scope; transitions defined on parent states are inherited by their substates as usual.
 
 ### <a name="resolution"></a>Callable resolution
 

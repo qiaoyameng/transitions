@@ -1159,6 +1159,227 @@ class Machine(object):
                 delattr(model, trigger)
             del self.events[trigger]
 
+    def modify_transitions(self, operations):
+        """Validate a batch of transition modifications and commit them to the machine at once.
+
+        The whole batch is validated BEFORE anything is changed. If any operation is invalid,
+        a ValueError is raised and neither the transition table nor the convenience methods bound
+        to models are altered. Validation covers state targets (including hierarchical state paths
+        for HierarchicalMachine), duplicate transition definitions (within the batch as well as
+        against the current transition table) and naming conflicts between newly created triggers
+        and existing attributes of the managed models. No user callbacks (conditions, prepare,
+        before/after, ...) are executed during validation or while committing.
+
+        Args:
+            operations (list): A list of dicts where each dict describes one operation:
+
+                - ``{'op': 'add', 'trigger': ..., 'source': ..., 'dest': ..., ...}`` adds a
+                  transition. Additional keys such as 'conditions', 'unless', 'before', 'after'
+                  or 'prepare' are passed to the created transition.
+                - ``{'op': 'remove', 'trigger': ..., 'source': ..., 'dest': ...}`` removes all
+                  matching transitions. 'source' and 'dest' default to the '*' wildcard. When the
+                  last transition of a trigger is removed, the trigger and its dynamic model
+                  methods are removed as well.
+                - ``{'op': 'replace', 'trigger': ..., 'source': ..., 'dest': ..., ...}`` removes
+                  all existing transitions of 'trigger' from the given source(s) and adds the new
+                  definition instead. At least one existing transition must match.
+
+        Note:
+            Events that are already being processed keep the consistent rule set that was in
+            effect when they started; only events triggered after the commit observe the new
+            rules. The commit swaps transition tables atomically instead of mutating them in
+            place, so this also holds for plain (not thread-safe) machines. When events are
+            processed concurrently by multiple threads, use LockedMachine (or
+            LockedHierarchicalMachine): there, modify_transitions is serialized with event
+            processing through the machine context, thus a batch commit never interleaves with
+            a running event. Since no user callbacks are executed while the modification lock
+            is held, committing a batch cannot deadlock with callback code.
+        """
+        plan = self._plan_transition_modifications(operations)
+        self._commit_transition_plan(plan)
+
+    def _plan_transition_modifications(self, operations):
+        """Validate all passed operations against a simulation of the current transition table
+            and return a commit plan without altering the machine."""
+        simulated = {}
+        for name, event in self.events.items():
+            simulated[name] = {(trans.source, trans.dest) for trans in
+                               itertools.chain.from_iterable(event.transitions.values())}
+        plan = []
+        conflict_checked = set()
+        for op in operations:
+            plan.extend(self._plan_transition_op(op, simulated, conflict_checked))
+        return plan
+
+    def _plan_transition_op(self, op, simulated, conflict_checked):
+        """Validate a single batch operation against the simulated transition table and return
+            the related plan entries. The simulation is updated to reflect the operation."""
+        if not isinstance(op, dict):
+            raise ValueError("Transition batch operations must be dicts but got %r." % (op,))
+        op = dict(op)
+        action = op.pop('op', None)
+        if action not in ('add', 'remove', 'replace'):
+            raise ValueError("Unknown transition batch operation '%s'. Supported operations "
+                             "are 'add', 'remove' and 'replace'." % action)
+        trigger = op.pop('trigger', None)
+        if not isinstance(trigger, string_types) or not trigger:
+            raise ValueError("Transition batch operation '%s' requires a trigger name." % action)
+        if trigger == self.model_attribute:
+            raise ValueError("Trigger name cannot be same as model attribute name.")
+        if action == 'remove':
+            source = self._normalize_remove_filter(op.pop('source', self.wildcard_all))
+            dest = self._normalize_remove_filter(op.pop('dest', self.wildcard_all))
+            if op:
+                raise ValueError("Unsupported arguments for transition removal: %s."
+                                 % ', '.join(sorted(op)))
+            if trigger not in simulated:
+                raise ValueError("Cannot remove transitions of unknown trigger '%s'." % trigger)
+            removed = {(src, dst) for src, dst in simulated[trigger]
+                       if (source == self.wildcard_all or src in source)
+                       and (dest == self.wildcard_all or dst in dest)}
+            if not removed:
+                raise ValueError("No transitions of trigger '%s' match the removal criteria."
+                                 % trigger)
+            simulated[trigger] -= removed
+            if not simulated[trigger]:
+                del simulated[trigger]
+            return [('remove', trigger, removed, None)]
+
+        for endpoint in ('source', 'dest'):
+            if endpoint not in op:
+                raise ValueError("Transition batch operation '%s' requires a '%s' definition."
+                                 % (action, endpoint))
+        pairs = self._expand_transition_pairs(op.pop('source'), op.pop('dest'))
+        plan = []
+        if action == 'replace':
+            if trigger not in simulated:
+                raise ValueError("Cannot replace transitions of unknown trigger '%s'." % trigger)
+            sources = {src for src, _ in pairs}
+            replaced = {(src, dst) for src, dst in simulated[trigger] if src in sources}
+            if not replaced:
+                raise ValueError("No existing transitions of trigger '%s' match the source(s) "
+                                 "to be replaced." % trigger)
+            simulated[trigger] -= replaced
+            if not simulated[trigger]:
+                del simulated[trigger]
+            plan.append(('remove', trigger, replaced, None))
+        if len(set(pairs)) != len(pairs):
+            raise ValueError("Operation '%s' of trigger '%s' contains duplicate transition "
+                             "definitions." % (action, trigger))
+        duplicates = set(pairs) & simulated.get(trigger, set())
+        if duplicates:
+            raise ValueError("Operation '%s' of trigger '%s' duplicates already defined "
+                             "transition(s): %s." % (action, trigger, duplicates))
+        if trigger not in self.events and trigger not in conflict_checked:
+            self._check_trigger_name_conflicts(trigger)
+            conflict_checked.add(trigger)
+        simulated.setdefault(trigger, set()).update(pairs)
+        # transition objects are created during validation to make sure invalid arguments
+        # (e.g. unknown keyword arguments) fail before anything is committed
+        transitions = [self._create_transition(src, dst, **op) for src, dst in pairs]
+        plan.append(('add', trigger, transitions, None))
+        return plan
+
+    def _expand_transition_pairs(self, source, dest):
+        """Expand wildcards and State/Enum references of a transition definition into a list of
+            concrete (source, dest) name tuples and validate that all referenced states exist."""
+        source, dest = self._convert_transition_endpoints(source, dest)
+        if source == self.wildcard_all:
+            sources = list(self.states.keys())
+        else:
+            sources = []
+            for src in listify(source):
+                if isinstance(src, State):
+                    self._has_state(src, raise_error=True)
+                    sources.append(src.name)
+                elif hasattr(src, 'name'):  # Enum members and state-like objects
+                    sources.append(src.name)
+                else:
+                    sources.append(src)
+        pairs = []
+        for src in sources:
+            self._validate_state_name(src)
+            if dest == self.wildcard_same:
+                pairs.append((src, src))
+            elif dest is None:
+                pairs.append((src, None))
+            else:
+                if isinstance(dest, State):
+                    self._has_state(dest, raise_error=True)
+                dst = dest.name if hasattr(dest, 'name') else dest
+                self._validate_state_name(dst)
+                pairs.append((src, dst))
+        return pairs
+
+    def _convert_transition_endpoints(self, source, dest):
+        """Hook to convert source and dest of a batch operation before expansion.
+            Overridden by HierarchicalMachine to resolve Enum state paths."""
+        return source, dest
+
+    def _validate_state_name(self, name):
+        """Check whether a state name refers to a registered state and raise ValueError if not."""
+        if name not in self.states:
+            raise ValueError("State '%s' is not a registered state." % name)
+
+    def _normalize_remove_filter(self, value):
+        """Convert a remove filter into either the '*' wildcard or a list of state names."""
+        if value == self.wildcard_all:
+            return self.wildcard_all
+        if value is None:  # filter for internal transitions (dest=None)
+            return [None]
+        return [val.name if hasattr(val, 'name') else val for val in listify(value)]
+
+    def _check_trigger_name_conflicts(self, trigger):
+        """Raise ValueError when a newly created trigger would clash with existing attributes
+            of one of the managed models."""
+        for model in self.models:
+            for name in (trigger, 'may_%s' % trigger):
+                if getattr(model, name, None) is not None and not self.model_override:
+                    raise ValueError("Cannot create trigger '%s' since attribute '%s' already "
+                                     "exists on model %r. Choose another trigger name or enable "
+                                     "model_override." % (trigger, name, model))
+
+    def _commit_transition_plan(self, plan):
+        """Apply a previously validated plan. Transition tables of events are swapped atomically
+            so that events which are currently processed keep their consistent rule set."""
+        per_trigger = OrderedDict()
+        for entry in plan:
+            per_trigger.setdefault(entry[1], []).append(entry)
+        for trigger, entries in per_trigger.items():
+            event = self.events.get(trigger)
+            mapping = defaultdict(list)
+            if event is not None:
+                for src, transitions in event.transitions.items():
+                    mapping[src] = list(transitions)
+            for action, _, data, _kwargs in entries:
+                if action == 'remove':
+                    for src in list(mapping.keys()):
+                        mapping[src] = [trans for trans in mapping[src]
+                                        if (trans.source, trans.dest) not in data]
+                        if not mapping[src]:
+                            del mapping[src]
+                else:
+                    for trans in data:
+                        mapping[trans.source].append(trans)
+            if mapping:
+                if event is None:
+                    event = self._create_event(trigger, self)
+                    event.transitions = mapping
+                    self.events[trigger] = event
+                    for model in self.models:
+                        self._add_trigger_to_model(trigger, model)
+                else:
+                    event.transitions = mapping
+            elif event is not None:
+                del self.events[trigger]
+                for model in self.models:
+                    self._remove_trigger_from_model(trigger, model)
+
+    def _remove_trigger_from_model(self, trigger, model):
+        for name in (trigger, 'may_%s' % trigger):
+            if getattr(model, name, None) is not None:
+                delattr(model, name)
+
     def dispatch(self, trigger, *args, **kwargs):
         """Trigger an event on all models assigned to the machine.
         Args:

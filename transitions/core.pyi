@@ -1,7 +1,7 @@
 from logging import Logger
 from typing import (
     Any, Optional, Callable, Sequence, Union, Iterable, List, Dict, DefaultDict,
-    Type, Deque, OrderedDict, Tuple, Literal, Collection, TypedDict, Required
+    Type, Deque, OrderedDict, Tuple, Literal, Collection, TypedDict, Required, Set
 )
 
 # Enums are supported for Python 3.4+ and Python 2.7 with enum34 package installed
@@ -104,6 +104,20 @@ class TransitionConfigDict(TypedDict, total=False):
 
 # For backwards compatibility we also accept generic collections
 TransitionConfig = Union[TransitionConfigList, TransitionConfigDict, Collection[str]]
+
+class TransitionBatchOperation(TypedDict, total=False):
+    op: Required[str]
+    trigger: Required[str]
+    source: Union[StateIdentifier, List[StateIdentifier]]
+    dest: Optional[StateIdentifier]
+    prepare: CallbacksArg
+    before: CallbacksArg
+    after: CallbacksArg
+    conditions: CallbacksArg
+    unless: CallbacksArg
+
+TransitionPair = Tuple[str, Optional[str]]
+TransitionPlanEntry = Tuple[str, str, Any, Any]
 
 class EventData:
     state: State
@@ -240,6 +254,19 @@ class Machine:
     def get_transitions(self, trigger: str = ...,
                         source: StateIdentifier = ..., dest: StateIdentifier = ...) -> List[Transition]: ...
     def remove_transition(self, trigger: str, source: StateIdentifier = ..., dest: StateIdentifier = ...) -> None: ...
+    def modify_transitions(self, operations: Sequence[TransitionBatchOperation]) -> None: ...
+    def _plan_transition_modifications(self, operations: Sequence[TransitionBatchOperation]
+                                       ) -> List[TransitionPlanEntry]: ...
+    def _plan_transition_op(self, op: TransitionBatchOperation,
+                            simulated: Dict[str, Set[TransitionPair]],
+                            conflict_checked: Set[str]) -> List[TransitionPlanEntry]: ...
+    def _expand_transition_pairs(self, source: Any, dest: Any) -> List[TransitionPair]: ...
+    def _convert_transition_endpoints(self, source: Any, dest: Any) -> Tuple[Any, Any]: ...
+    def _validate_state_name(self, name: str) -> None: ...
+    def _normalize_remove_filter(self, value: Any) -> Union[str, List[Any]]: ...
+    def _check_trigger_name_conflicts(self, trigger: str) -> None: ...
+    def _commit_transition_plan(self, plan: List[TransitionPlanEntry]) -> None: ...
+    def _remove_trigger_from_model(self, trigger: str, model: object) -> None: ...
     def dispatch(self, trigger: str, *args: Any, **kwargs: Any) -> bool: ...
     def callbacks(self, funcs: Iterable[Callback], event_data: EventData) -> None: ...
     def callback(self, func: Callback, event_data: EventData) -> None: ...

@@ -759,6 +759,38 @@ class HierarchicalMachine(Machine):
             for model in self.models:
                 delattr(model, trigger)
 
+    def modify_transitions(self, operations):
+        """Extends transitions.core.Machine.modify_transitions to operate on the root scope of
+            the state tree. Source and dest of the passed operations may contain (nested) state
+            paths which are validated against the state tree. Transitions defined on parent
+            states are inherited by their substates when events are processed. Note that only
+            transitions of the root scope are managed; transitions added to nested scopes
+            (e.g. via ``with machine('state'): ...``) are not affected by batch operations.
+        """
+        with self():
+            super(HierarchicalMachine, self).modify_transitions(operations)
+
+    def _convert_transition_endpoints(self, source, dest):
+        if source == self.wildcard_all and dest == self.wildcard_same:
+            source = self.get_nested_state_names()
+        else:
+            if source != self.wildcard_all:
+                source = [self.state_cls.separator.join(self._get_enum_path(s)) if isinstance(s, Enum) else s
+                          for s in listify(source)]
+            if dest != self.wildcard_same:
+                dest = self.state_cls.separator.join(self._get_enum_path(dest)) if isinstance(dest, Enum) else dest
+        return source, dest
+
+    def _validate_state_name(self, name):
+        # get_state resolves (nested) state paths and raises a ValueError for invalid targets
+        self.get_state(name)
+
+    def _normalize_remove_filter(self, value):
+        if value == self.wildcard_all or value is None:
+            return super(HierarchicalMachine, self)._normalize_remove_filter(value)
+        return [self.state_cls.separator.join(self._get_enum_path(val)) if isinstance(val, Enum)
+                else val.name if hasattr(val, 'name') else val for val in listify(value)]
+
     def _can_trigger(self, model, trigger, *args, **kwargs):
         state_tree = self.build_state_tree(getattr(model, self.model_attribute), self.state_cls.separator)
         ordered_states = resolve_order(state_tree)
