@@ -1159,6 +1159,269 @@ class Machine(object):
                 delattr(model, trigger)
             del self.events[trigger]
 
+    def update_transitions(self, operations):
+        """Validate a batch of transition operations and commit them to the machine atomically.
+
+        All operations are validated against a working copy of the current event table first.
+        Only when every operation is valid, the new rule set is committed in a single step.
+        If validation fails, a ``ValueError`` is raised and neither the transition table nor
+        the methods bound to models are altered.
+
+        Validation covers:
+            * state targets: source and destination states (or state paths for
+              ``HierarchicalMachine``) must be registered states; the wildcards ``*`` (all
+              states) and ``=`` (source state) are allowed as in ``add_transition``
+            * duplicate definitions: an 'add' operation must not redefine an already
+              existing (trigger, source, dest) combination, neither from the current rule
+              set nor from earlier operations of the same batch
+            * name conflicts: a new trigger name must not collide with dynamically generated
+              methods (e.g. ``is_<state>``, ``on_enter_<state>``, ``may_<trigger>``) or with
+              existing attributes of the attached models (unless ``model_override`` is True)
+            * removals and replacements must match at least one existing transition
+
+        Events that are currently being processed keep the consistent rule set they started
+        with; only events triggered after the commit use the new rules. No user callbacks are
+        executed while the new rule set is committed. When used with ``LockedMachine``, the
+        whole validation and commit is serialized with event processing and other machine
+        methods, so models never observe a half-updated rule set. Plain ``Machine`` instances
+        do not serialize concurrent ``update_transitions`` calls; use ``LockedMachine`` (or
+        external synchronization) when batches may be committed from multiple threads.
+
+        Args:
+            operations (list): A list of operation dictionaries (a single dictionary is
+                accepted as well). Each dictionary must contain an ``op`` and a ``trigger``
+                key. ``op`` may be one of:
+                    * 'add': requires 'source' and 'dest'; all further keys (e.g.
+                      'conditions', 'before') are passed on to the created transition.
+                    * 'replace': requires 'source' and 'dest'; removes all existing
+                      transitions of 'trigger' from 'source' before adding the new definition.
+                    * 'remove': removes all transitions of 'trigger' matching the optional
+                      'source' (default '*') and 'dest' (default '*') filters. When the last
+                      transition of a trigger is removed, the trigger is removed from the
+                      machine and all models.
+        """
+        work, touched = self._build_transition_table(listify(operations))
+        self._commit_transition_table(work, touched)
+
+    def _build_transition_table(self, operations):
+        """Validate operations against a working copy of the current event table.
+        Args:
+            operations (list): List of operation dictionaries.
+        Returns:
+            tuple: A (dict) working copy of the event table with all operations applied and
+                   a (set) with the names of all triggers affected by the operations.
+        """
+        work = {name: {source: list(transitions) for source, transitions in event.transitions.items()}
+                for name, event in self.events.items()}
+        touched = set()
+        checked = set()
+        for operation in operations:
+            action, trigger, source, dest, kwargs = self._normalize_transition_operation(operation)
+            if trigger not in self.events and trigger not in checked:
+                self._check_trigger_name(trigger)
+            checked.add(trigger)
+            touched.add(trigger)
+            if action == 'remove':
+                self._remove_from_transition_table(work, trigger, source, dest)
+            else:
+                if action == 'replace':
+                    self._remove_from_transition_table(work, trigger, source, self.wildcard_all)
+                self._add_to_transition_table(work, trigger, source, dest, kwargs)
+        return work, touched
+
+    def _normalize_transition_operation(self, operation):
+        """Split an operation dictionary into action, trigger, source, dest and transition
+        keyword arguments. Raises a ValueError when required keys are missing or unsupported
+        keys are passed."""
+        if not isinstance(operation, dict):
+            raise ValueError("Transition operations must be dictionaries but got %r." % (operation,))
+        operation = dict(operation)
+        action = operation.pop('op', None)
+        if action not in ('add', 'replace', 'remove'):
+            raise ValueError("Transition operation must be one of 'add', 'replace' or 'remove' "
+                             "but got %r." % (action,))
+        try:
+            trigger = operation.pop('trigger')
+        except KeyError:
+            raise ValueError("Transition operation '%s' requires a 'trigger' key." % action)
+        if action == 'remove':
+            source = operation.pop('source', self.wildcard_all)
+            dest = operation.pop('dest', self.wildcard_all)
+            if operation:
+                raise ValueError("Operation 'remove' does not support the keyword(s): %s."
+                                 % ", ".join(sorted(operation)))
+            kwargs = {}
+        else:
+            try:
+                source = operation.pop('source')
+                dest = operation.pop('dest')
+            except KeyError as err:
+                raise ValueError("Operation '%s' requires a %s key." % (action, err))
+            kwargs = operation
+        return action, trigger, source, dest, kwargs
+
+    def _add_to_transition_table(self, work, trigger, source, dest, kwargs):
+        """Add a transition definition to the working copy of the event table after
+        validating state targets and duplicates."""
+        trans_map = work.setdefault(trigger, {})
+        for source_name in self._resolve_source_names(source, dest):
+            self._validate_state_target(source_name)
+            dest_name = self._resolve_dest_reference(dest, source_name)
+            if dest_name is not None:
+                self._validate_state_target(dest_name)
+            transitions = trans_map.setdefault(source_name, [])
+            if any(trans.dest == dest_name for trans in transitions):
+                raise ValueError("Duplicate definition of transition '%s' from state '%s' to '%s'."
+                                 % (trigger, source_name, dest_name))
+            transitions.append(self._create_transition(source_name, dest_name, **kwargs))
+
+    def _remove_from_transition_table(self, work, trigger, source, dest):
+        """Remove transitions matching the passed criteria from the working copy of the
+        event table. Raises a ValueError when nothing matches."""
+        if trigger not in work:
+            raise ValueError("Cannot remove transitions of unknown trigger '%s'." % trigger)
+        if source == self.wildcard_all:
+            source_names = None
+        else:
+            source_names = [self._resolve_state_reference(state) for state in listify(source)]
+        if dest == self.wildcard_all:
+            dest_names = None
+        elif dest is None:
+            dest_names = [None]
+        else:
+            dest_names = [self._resolve_state_reference(state) for state in listify(dest)]
+        removed = 0
+        trans_map = work[trigger]
+        for source_name in list(trans_map):
+            if source_names is not None and source_name not in source_names:
+                continue
+            kept = [trans for trans in trans_map[source_name]
+                    if dest_names is not None and trans.dest not in dest_names]
+            removed += len(trans_map[source_name]) - len(kept)
+            if kept:
+                trans_map[source_name] = kept
+            else:
+                del trans_map[source_name]
+        if removed == 0:
+            raise ValueError("No transitions of trigger '%s' match the passed source/dest "
+                             "criteria." % trigger)
+
+    def _resolve_source_names(self, source, dest=None):
+        """Convert a source definition (wildcard, State, Enum, name or a list of those)
+        into a list of state names."""
+        if source == self.wildcard_all:
+            return list(self.states.keys())
+        return [self._resolve_state_reference(state) for state in listify(source)]
+
+    def _resolve_state_reference(self, state):
+        """Convert a State, Enum or string state reference into a state name."""
+        if isinstance(state, State):
+            self._has_state(state, raise_error=True)
+            return state.name
+        if isinstance(state, Enum):
+            return state.name
+        return state
+
+    def _resolve_dest_reference(self, dest, source_name):
+        """Convert a destination definition into a state name. Handles internal transitions
+        (dest=None) and reflexive wildcards (dest='=')."""
+        if dest is None:
+            return None
+        if dest == self.wildcard_same:
+            return source_name
+        return self._resolve_state_reference(dest)
+
+    def _validate_state_target(self, state_name):
+        """Raise a ValueError when the passed state name (or path) is not registered."""
+        self.get_state(state_name)
+
+    def _check_trigger_name(self, trigger):
+        """Raise a ValueError when a new trigger name is invalid or conflicts with
+        dynamically generated methods or existing model attributes."""
+        if not isinstance(trigger, string_types) or not trigger:
+            raise ValueError("Trigger names must be non-empty strings but got %r." % (trigger,))
+        if trigger == self.model_attribute:
+            raise ValueError("Trigger name cannot be same as model attribute name.")
+        if trigger in self._dynamic_method_names():
+            raise ValueError("Trigger name '%s' conflicts with a dynamically generated method "
+                             "of the machine." % trigger)
+        if not self.model_override:
+            for model in self.models:
+                if getattr(model, trigger, None) is not None:
+                    raise ValueError("Trigger name '%s' conflicts with an attribute of model %r. "
+                                     "Set model_override=True to allow overriding existing "
+                                     "attributes." % (trigger, model))
+
+    def _dynamic_method_names(self):
+        """Collect the names of all methods the machine (dynamically) assigns to models."""
+        names = {'trigger', 'may_trigger'}
+        for state_name in self._dynamic_state_names():
+            if self.model_attribute == 'state':
+                names.add('is_%s' % state_name)
+            else:
+                names.add('is_%s_%s' % (self.model_attribute, state_name))
+            for callback in self.state_cls.dynamic_methods:
+                names.add('%s%s%s' % (callback, self.separator, state_name))
+        for event_name in self.events:
+            names.add('may_%s' % event_name)
+            for callback in self.transition_cls.dynamic_methods:
+                names.add('%s%s%s' % (callback, self.separator, event_name))
+        return names
+
+    def _dynamic_state_names(self):
+        """Return the state names used for dynamically generated model methods."""
+        return list(self.states.keys())
+
+    def _commit_transition_table(self, work, touched):
+        """Swap the current event table with the validated working copy and update the
+        trigger methods bound to models. Events that are currently processed keep a
+        reference to the previous Event objects and finish with the rule set they
+        started with."""
+        old_events = self.events
+        new_events = OrderedDict(old_events)
+        for trigger in touched:
+            trans_map = work.get(trigger) or {}
+            if any(trans_map.values()):
+                event = self._create_event(trigger, self)
+                event.transitions = defaultdict(list, {source: transitions
+                                                       for source, transitions in trans_map.items()
+                                                       if transitions})
+                new_events[trigger] = event
+            else:
+                new_events.pop(trigger, None)
+        self.events = new_events
+        for model in self.models:
+            for trigger in touched:
+                if trigger not in new_events:
+                    self._remove_trigger_from_model(trigger, model, old_events.get(trigger))
+                elif trigger not in old_events:
+                    self._add_trigger_to_model(trigger, model)
+                else:
+                    self._rebind_trigger(trigger, model, old_events[trigger], new_events[trigger])
+
+    def _rebind_trigger(self, trigger, model, old_event, new_event):
+        """Point the model's trigger method at the updated event object. Only bindings
+        previously created by the machine are updated; attributes owned by the model
+        itself (see model_override) are left untouched."""
+        current = getattr(model, trigger, None)
+        if isinstance(current, partial) and current.func == old_event.trigger:
+            setattr(model, trigger, partial(new_event.trigger, model))
+
+    def _remove_trigger_from_model(self, trigger, model, event):
+        """Remove a trigger method from a model. Only bindings previously created by the
+        machine are removed; attributes owned by the model itself are left untouched."""
+        current = getattr(model, trigger, None)
+        if event is not None and isinstance(current, partial) and current.func == event.trigger:
+            delattr(model, trigger)
+
+    @staticmethod
+    def _wraps_method(func, name):
+        """Check whether func is a bound method (or a partial chain wrapping one, as used
+        by LockedMachine) with the passed name."""
+        while isinstance(func, partial) and len(func.args) == 1:
+            func = func.args[0]
+        return getattr(func, '__name__', None) == name
+
     def dispatch(self, trigger, *args, **kwargs):
         """Trigger an event on all models assigned to the machine.
         Args:

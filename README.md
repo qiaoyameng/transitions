@@ -685,6 +685,26 @@ machine.next_state()
 machine.next_state() # transitions.core.MachineError: "Can't trigger event next_state from state C!"
 ```
 
+#### <a name="batch-transitions"></a> Batch updates
+
+When several transitions have to be changed at once -- for instance because a rule backend reconfigures a running machine -- adding and removing transitions one by one would let models observe a half-updated rule set. `update_transitions` accepts a batch of `add`, `replace` and `remove` operations, validates the whole group first and commits it to the machine in a single step:
+
+```python
+machine = Machine(states=['A', 'B', 'C'], initial='A')
+machine.add_transition('go', 'A', 'B')
+machine.update_transitions([
+    {'op': 'replace', 'trigger': 'go', 'source': 'A', 'dest': 'C'},
+    {'op': 'add', 'trigger': 'back', 'source': 'C', 'dest': 'A', 'before': 'log'},
+    {'op': 'remove', 'trigger': 'to_B'},  # remove an automatic transition
+])
+machine.go()  # A -> C
+machine.back()  # C -> A
+```
+
+Every operation is validated before anything is changed: source and destination states (or state paths for `HierarchicalMachine`) must be registered, an `add` must not duplicate an existing `(trigger, source, dest)` definition, new trigger names must not collide with dynamically generated methods (e.g. `is_<state>` or `may_<trigger>`) or existing model attributes, and `replace`/`remove` must match at least one existing transition. If any operation is invalid, a `ValueError` is raised and neither the transition table nor the methods bound to models are altered. When the last transition of a trigger is removed, the trigger method is removed from the machine and all models as well.
+
+Events that are already being processed finish with the consistent rule set they started with; only events triggered after the commit use the new rules. No user callbacks are executed while the new rule set is committed. `update_transitions` works with `Machine` and `HierarchicalMachine` (where it must be called from the root scope). With `LockedMachine`, validation and commit are serialized with event processing and other machine methods, so concurrent triggers never observe a partially updated rule set; plain `Machine` instances do not serialize concurrent `update_transitions` calls, so use `LockedMachine` (or external locking) when batches are committed from multiple threads.
+
 #### <a name="queued-transitions"></a>Queued transitions
 
 The default behaviour in Transitions is to process events instantly. This means events within an `on_enter` method will be processed _before_ callbacks bound to `after` are called.

@@ -759,6 +759,55 @@ class HierarchicalMachine(Machine):
             for model in self.models:
                 delattr(model, trigger)
 
+    def update_transitions(self, operations):
+        """Extends `transitions.core.Machine.update_transitions` to resolve hierarchical
+        state paths. Source and destination states may be given as (nested) state paths
+        (e.g. 'A_1'), State or Enum instances; transitions defined for a parent state are
+        inherited by its substates as usual. The batch operates on the machine's root
+        scope and must be called from there.
+        Args:
+            operations (list): A list of operation dictionaries (see
+                `transitions.core.Machine.update_transitions`).
+        """
+        if self.scoped is not self:
+            raise MachineError("HierarchicalMachine.update_transitions must be called from "
+                               "the root scope.")
+        super(HierarchicalMachine, self).update_transitions(operations)
+
+    def _dynamic_state_names(self):
+        return self.get_nested_state_names()
+
+    def _dynamic_method_names(self):
+        names = super(HierarchicalMachine, self)._dynamic_method_names()
+        names.add('to')
+        return names
+
+    def _resolve_state_reference(self, state):
+        if isinstance(state, Enum):
+            return self.state_cls.separator.join(self._get_enum_path(state))
+        return super(HierarchicalMachine, self)._resolve_state_reference(state)
+
+    def _resolve_source_names(self, source, dest=None):
+        if source == self.wildcard_all and dest == self.wildcard_same:
+            return self.get_nested_state_names()
+        return super(HierarchicalMachine, self)._resolve_source_names(source, dest)
+
+    def _rebind_trigger(self, trigger, model, old_event, new_event):
+        # HierarchicalMachine binds models to Machine.trigger_event which resolves events
+        # dynamically by name; updated event objects are picked up automatically and
+        # no rebinding is required.
+        pass
+
+    def _remove_trigger_from_model(self, trigger, model, event):
+        current = getattr(model, trigger, None)
+        # LockedMachine wraps bound methods in partials which are flattened by functools;
+        # check the trailing arguments and all involved callables to identify own bindings
+        if not isinstance(current, partial) or current.args[-2:] != (model, trigger):
+            return
+        candidates = (current.func,) + current.args[:-2]
+        if any(self._wraps_method(func, 'trigger_event') for func in candidates):
+            delattr(model, trigger)
+
     def _can_trigger(self, model, trigger, *args, **kwargs):
         state_tree = self.build_state_tree(getattr(model, self.model_attribute), self.state_cls.separator)
         ordered_states = resolve_order(state_tree)
