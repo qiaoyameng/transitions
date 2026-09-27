@@ -180,9 +180,10 @@ class NestedState(State):
     dynamic_methods = State.dynamic_methods + ["on_final"]
 
     def __init__(self, name, on_enter=None, on_exit=None, ignore_invalid_triggers=None, final=False, initial=None,
-                 on_final=None):
+                 on_final=None, deferred=None):
         super(NestedState, self).__init__(name=name, on_enter=on_enter, on_exit=on_exit,
-                                          ignore_invalid_triggers=ignore_invalid_triggers, final=final)
+                                          ignore_invalid_triggers=ignore_invalid_triggers, final=final,
+                                          deferred=deferred)
         self.initial = initial
         self.events = {}
         self.states = OrderedDict()
@@ -399,7 +400,7 @@ class HierarchicalMachine(Machine):
                  ordered_transitions=False, ignore_invalid_triggers=None,
                  before_state_change=None, after_state_change=None, name=None,
                  queued=False, prepare_event=None, finalize_event=None, model_attribute='state',
-                 model_override=False, on_exception=None, on_final=None, **kwargs):
+                 model_override=False, on_exception=None, on_final=None, max_deferred=None, **kwargs):
         assert issubclass(self.state_cls, NestedState)
         assert issubclass(self.event_cls, NestedEvent)
         assert issubclass(self.transition_cls, NestedTransition)
@@ -413,7 +414,8 @@ class HierarchicalMachine(Machine):
             ordered_transitions=ordered_transitions, ignore_invalid_triggers=ignore_invalid_triggers,
             before_state_change=before_state_change, after_state_change=after_state_change, name=name,
             queued=queued, prepare_event=prepare_event, finalize_event=finalize_event, model_attribute=model_attribute,
-            model_override=model_override, on_exception=on_exception, on_final=on_final, **kwargs
+            model_override=model_override, on_exception=on_exception, on_final=on_final,
+            max_deferred=max_deferred, **kwargs
         )
 
     def __call__(self, to_scope=None):
@@ -909,9 +911,12 @@ class HierarchicalMachine(Machine):
 
     def _trigger_event(self, event_data, trigger):
         try:
-            with self():
-                res = self._trigger_event_nested(event_data, trigger, None)
-            event_data.result = self._check_event_result(res, event_data.model, trigger)
+            if self._defer_event(event_data.model, trigger, event_data.args, event_data.kwargs):
+                event_data.result = True
+            else:
+                with self():
+                    res = self._trigger_event_nested(event_data, trigger, None)
+                event_data.result = self._check_event_result(res, event_data.model, trigger)
         except BaseException as err:  # pylint: disable=broad-except; Exception will be handled elsewhere
             event_data.error = err
             if self.on_exception:
@@ -1131,6 +1136,61 @@ class HierarchicalMachine(Machine):
             bool: True if a transitions has been conducted or the trigger event has been queued.
         """
         return self.trigger_event(model, trigger_name, *args, **kwargs)
+
+    def _is_deferred(self, model, event_name):
+        """Check whether the passed event is deferred for the model's current state configuration.
+        Declarations of more specific (nested) states take precedence over declarations of their
+        parents: the innermost active state with an explicit 'deferred' declaration decides whether
+        the event is deferred. In parallel state configurations the event is deferred as soon as
+        ANY active region requires it to be deferred.
+        Args:
+            model (object): The model whose current state configuration should be checked.
+            event_name (str): Name of the event to check.
+        Returns:
+            bool: Whether the event should be deferred.
+        """
+        # state lookup is scope-dependent; reset the machine to the root scope first
+        with self():
+            state_tree = self.build_state_tree(listify(getattr(model, self.model_attribute)),
+                                               self.state_cls.separator)
+            for path in self._get_active_paths(state_tree):
+                # check the active state path from the innermost state to the root;
+                # the first (most specific) explicit declaration wins
+                for depth in range(len(path), 0, -1):
+                    deferred = self.get_state(path[:depth]).deferred
+                    if deferred is not None:
+                        if event_name in deferred:
+                            return True
+                        break
+        return False
+
+    @staticmethod
+    def _get_active_paths(state_tree, prefix=None):
+        """Collects all root-to-leaf paths of currently active states.
+        Args:
+            state_tree (dict): A dictionary representation of the model's state.
+            prefix (list): Names of already traversed (parent) states.
+        Returns:
+            list of lists of str representing the paths of all active (leaf) states.
+        """
+        prefix = prefix or []
+        paths = []
+        for state_name, subtree in state_tree.items():
+            if subtree:
+                paths.extend(HierarchicalMachine._get_active_paths(subtree, prefix + [state_name]))
+            else:
+                paths.append(prefix + [state_name])
+        return paths
+
+    def _trigger_deferred(self, model, event_name, args, kwargs):
+        """Re-submit a previously deferred event with the arguments stored at submission time.
+        Args:
+            model (object): The model the event has been triggered on.
+            event_name (str): Name of the deferred event.
+            args (tuple): Positional arguments stored at submission time.
+            kwargs (dict): Keyword arguments stored at submission time.
+        """
+        self.trigger_event(model, event_name, *args, **kwargs)
 
     def _has_state(self, state, raise_error=False):
         """This function

@@ -40,6 +40,7 @@ A lightweight, object-oriented state machine implementation in Python with many 
     - [Internal transitions](#internal-transitions)
     - [Ordered transitions](#ordered-transitions)
     - [Queued transitions](#queued-transitions)
+    - [Deferred events](#deferred-events)
     - [Conditional transitions](#conditional-transitions)
     - [Check transitions](#check-transitions)
     - [Callbacks](#transition-callbacks)
@@ -758,6 +759,50 @@ class Model:
     def on_enter_B(self):
         self.to_C()  # add event to queue ...
         self.machine.remove_model(self)  # aaaand it's gone
+```
+
+#### <a name="deferred-events"></a>Deferred events
+
+Sometimes events should not be processed (or rejected) right away but _deferred_ until the model has left the current state -- for instance, sensor readings arriving while a device is calibrating. States can declare such events with the `deferred` keyword. A deferred event is stored in a dedicated per-model queue (separate from the queue used by `queued=True`) together with the arguments passed at submission time and is re-triggered once the model reaches a state that does not defer it anymore. Deferred triggers return `True` since the event has been accepted for later processing.
+
+```python
+class Device:
+    def log(self, reading):
+        print("processed", reading)
+
+device = Device()
+states = [{'name': 'calibrating', 'deferred': ['measure']}, 'ready']
+machine = Machine(device, states=states, initial='calibrating')
+machine.add_transition('measure', 'ready', 'ready', after='log')
+machine.add_transition('finish', 'calibrating', 'ready')
+
+device.measure(1)  # deferred while calibrating
+device.measure(2)  # deferred as well
+device.state
+>>> 'calibrating'
+device.finish()    # deferred events are re-triggered in submission order
+>>> 'processed 1'
+>>> 'processed 2'
+```
+
+Deferred events are re-submitted after the currently processed event has been completed (in `queued` mode, after the events already stored in the transition queue). Events that are _still_ deferred by the new state remain in the deferred queue and are not re-queued, which prevents processing loops. If a re-submitted event has no valid transition in the new state, it is handled like any other invalid trigger. When a model is removed from the machine, its deferred events are discarded as well.
+
+The number of deferred events stored per model can be limited with `max_deferred`. When the limit is reached, the _oldest_ deferred event is dropped (and a warning is logged) to make room for the most recent one. The default `max_deferred=None` means no limit.
+
+```python
+machine = Machine(device, states=states, initial='calibrating', max_deferred=100)
+```
+
+`HierarchicalMachine` evaluates `deferred` declarations along the active state path: the innermost state with an explicit `deferred` declaration decides -- a child's declaration takes precedence over (and replaces) its parent's. States without their own declaration inherit the declaration of their closest ancestor. In parallel state configurations, an event is deferred as soon as _any_ active region requires it to be deferred.
+
+```python
+states = [
+    {'name': 'calibrating', 'deferred': ['measure'], 'children': [
+        'raw',
+        {'name': 'fine', 'deferred': []},  # overrides the parent: nothing is deferred here
+    ]},
+    'ready',
+]
 ```
 
 #### <a name="conditional-transitions"></a>Conditional transitions

@@ -85,6 +85,9 @@ class State(object):
         on_enter (list): Callbacks executed when a state is entered.
         on_exit (list): Callbacks executed when a state is exited.
         ignore_invalid_triggers (bool): Indicates if unhandled/invalid triggers should raise an exception.
+        deferred (list): Events which should be deferred (temporarily stored) while a model is in this
+            state and re-triggered when the state is left. Is None when no deferred events have been
+            declared explicitly.
     """
 
     # A list of dynamic methods which can be resolved by a ``Machine`` instance for convenience functions.
@@ -92,7 +95,7 @@ class State(object):
     dynamic_methods = ['on_enter', 'on_exit']
 
     def __init__(self, name, on_enter=None, on_exit=None,
-                 ignore_invalid_triggers=None, final=False):
+                 ignore_invalid_triggers=None, final=False, deferred=None):
         """
         Args:
             name (str or Enum): The name of the state
@@ -104,6 +107,10 @@ class State(object):
                 callable, or a list of strings.
             ignore_invalid_triggers (Boolean): Optional flag to indicate if
                 unhandled/invalid triggers should raise an exception
+            deferred (str or list): Optional event name(s) which should not be processed
+                immediately but stored in a (per model) queue while a model is in this state.
+                Deferred events are re-triggered (in submission order) once the model
+                reaches a state which does not defer them.
 
         """
         self._name = name
@@ -111,6 +118,7 @@ class State(object):
         self.ignore_invalid_triggers = ignore_invalid_triggers
         self.on_enter = listify(on_enter) if on_enter else []
         self.on_exit = listify(on_exit) if on_exit else []
+        self.deferred = None if deferred is None else listify(deferred)
 
     @property
     def name(self):
@@ -416,6 +424,10 @@ class Event(object):
         """
         event_data.state = self.machine.get_model_state(event_data.model)
         try:
+            # pylint: disable=protected-access
+            if self.machine._defer_event(event_data.model, self.name, event_data.args, event_data.kwargs):
+                event_data.result = True
+                return event_data.result
             if self._is_valid_source(event_data.state):
                 self._process(event_data)
         except BaseException as err:  # pylint: disable=broad-except; Exception will be handled elsewhere
@@ -497,6 +509,9 @@ class Machine(object):
             present state (e.g., calling an a_to_b() trigger when the current state is c) will be silently
             ignored rather than raising an invalid transition exception.
         name (str): Name of the ``Machine`` instance mainly used for easier log message distinction.
+        max_deferred (int): Maximum number of deferred events stored per model. When the limit is
+            reached, the oldest deferred event is dropped (and a warning is logged) to make room for
+            the most recent one. When None (default), the number of deferred events is not limited.
     """
 
     separator = '_'  # separates callback type from state/transition name
@@ -512,7 +527,7 @@ class Machine(object):
                  ordered_transitions=False, ignore_invalid_triggers=None,
                  before_state_change=None, after_state_change=None, name=None,
                  queued=False, prepare_event=None, finalize_event=None, model_attribute='state', model_override=False,
-                 on_exception=None, on_final=None, **kwargs):
+                 on_exception=None, on_final=None, max_deferred=None, **kwargs):
         """
         Args:
             model (object or list): The object(s) whose states we want to manage. If set to `Machine.self_literal`
@@ -558,6 +573,9 @@ class Machine(object):
                 This is also called when a transition raises an exception.
             on_exception: A callable called when an event raises an exception. If not set,
                 the exception will be raised instead.
+            max_deferred (int): Optional limit of deferred events stored per model. When the limit
+                is reached, the oldest deferred event is discarded (drop-oldest) and a warning is
+                logged. Deferred events are stored separately from the (queued) transition queue.
 
             **kwargs additional arguments passed to next class in MRO. This can be ignored in most cases.
         """
@@ -572,6 +590,7 @@ class Machine(object):
         # initialize protected attributes first
         self._queued = queued
         self._transition_queue = deque()
+        self._deferred_queues = {}
         self._before_state_change = []
         self._after_state_change = []
         self._prepare_event = []
@@ -579,6 +598,7 @@ class Machine(object):
         self._on_exception = []
         self._on_final = []
         self._initial = None
+        self.max_deferred = max_deferred
 
         self.states = OrderedDict()
         self.events = OrderedDict()
@@ -639,11 +659,13 @@ class Machine(object):
     def remove_model(self, model):
         """Remove a model from the state machine. The model will still contain all previously added triggers
         and callbacks, but will not receive updates when states or transitions are added to the Machine.
-        If an event queue is used, all queued events of that model will be removed."""
+        If an event queue is used, all queued events of that model will be removed. The same applies
+        to events stored in the model's deferred event queue."""
         models = listify(model)
 
         for mod in models:
             self.models.remove(mod)
+            self._deferred_queues.pop(mod, None)
         if len(self._transition_queue) > 0:
             # the first element of the list is currently executed. Keeping it for further Machine._process(ing)
             self._transition_queue = deque(
@@ -1239,7 +1261,10 @@ class Machine(object):
         if not self.has_queue:
             if not self._transition_queue:
                 # if trigger raises an Error, it has to be handled by the Machine.process caller
-                return trigger()
+                result = trigger()
+                # re-submit deferred events which are not deferred by the (new) current state
+                self._process_deferred()
+                return result
             raise MachineError("Attempt to process events synchronously while transition queue is not empty!")
 
         # process queued events
@@ -1253,11 +1278,86 @@ class Machine(object):
             try:
                 self._transition_queue[0]()
                 self._transition_queue.popleft()
+                # re-submit deferred events which are not deferred by the (new) current state
+                self._process_deferred()
             except BaseException:
                 # if a transition raises an exception, clear queue and delegate exception handling
                 self._transition_queue.clear()
                 raise
         return True
+
+    def _is_deferred(self, model, event_name):
+        """Check whether the passed event is declared as deferred by the model's current state.
+        Args:
+            model (object): The model whose current state should be checked.
+            event_name (str): Name of the event to check.
+        Returns:
+            bool: Whether the event should be deferred.
+        """
+        deferred = self.get_model_state(model).deferred
+        return deferred is not None and event_name in deferred
+
+    def _defer_event(self, model, event_name, args, kwargs):
+        """Store the passed event in the model's deferred event queue if the model's current state
+        declares it as deferred. Deferred events are stored separately from the (queued) transition
+        queue and keep the arguments passed at submission time. When ``max_deferred`` is set and the
+        model's deferred queue is full, the oldest deferred event is dropped (drop-oldest) and a
+        warning is logged.
+        Args:
+            model (object): The model the event has been triggered on.
+            event_name (str): Name of the triggered event.
+            args (tuple): Positional arguments passed to the trigger.
+            kwargs (dict): Keyword arguments passed to the trigger.
+        Returns:
+            bool: Whether the event has been deferred.
+        """
+        if not self._is_deferred(model, event_name):
+            return False
+        queue = self._deferred_queues.setdefault(model, deque())
+        if self.max_deferred is not None:
+            while queue and len(queue) >= self.max_deferred:
+                dropped = queue.popleft()
+                _LOGGER.warning("%sDeferred event queue of model %s is full (max_deferred=%s). "
+                                "Dropped oldest deferred event '%s'.",
+                                self.name, model, self.max_deferred, dropped[0])
+            if len(queue) >= self.max_deferred:
+                _LOGGER.warning("%sDeferred event '%s' of model %s has been dropped since "
+                                "max_deferred is smaller than 1.", self.name, event_name, model)
+                return True
+        queue.append((event_name, args, kwargs))
+        _LOGGER.debug("%sDeferred event '%s' for model %s.", self.name, event_name, model)
+        return True
+
+    def _process_deferred(self):
+        """Re-submit deferred events which are no longer deferred by the current state of their model.
+        Events are re-submitted in submission order (per model). Events which are still deferred
+        remain in the deferred queue and are NOT re-queued into the transition queue to prevent
+        processing loops while the model stays in a deferring state."""
+        for model, queue in list(self._deferred_queues.items()):
+            keep = deque()
+            ready = []
+            while queue:
+                event_name, args, kwargs = queue.popleft()
+                if self._is_deferred(model, event_name):
+                    # still deferred; keep the event in the deferred queue ...
+                    keep.append((event_name, args, kwargs))
+                else:
+                    # ... otherwise re-submit it after all remaining events have been checked
+                    ready.append((event_name, args, kwargs))
+            # re-queue still deferred events in their original (relative) submission order
+            queue.extend(keep)
+            for event_name, args, kwargs in ready:
+                self._trigger_deferred(model, event_name, args, kwargs)
+
+    def _trigger_deferred(self, model, event_name, args, kwargs):
+        """Re-submit a previously deferred event with the arguments stored at submission time.
+        Args:
+            model (object): The model the event has been triggered on.
+            event_name (str): Name of the deferred event.
+            args (tuple): Positional arguments stored at submission time.
+            kwargs (dict): Keyword arguments stored at submission time.
+        """
+        self.events[event_name].trigger(model, *args, **kwargs)
 
     def _identify_callback(self, name):
         # Does the prefix match a known callback?

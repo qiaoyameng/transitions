@@ -2,6 +2,7 @@
 
 ## 0.9.4 ()
 
+- Feature: States can declare `deferred` events which are stored per model while the state is active and re-triggered (in submission order, with the arguments passed at submission time) once the state is left; supported by `Machine` and `HierarchicalMachine`; the per-model backlog can be limited with `Machine(max_deferred=...)` (drop-oldest on overflow)
 - Bug #688: `Machine.remove_transitions` did not work with `State` and `Enum` even though the signature implied this (thanks @hookokoko)
 - PR #696: Improve handling of `StrEnum` which were previously confused as string (thanks @jbrocher)
 - Bug #697: An empty string as a destination made a transition internal but only `dest=None` should do this (thanks @rudy-lath-vizio)
