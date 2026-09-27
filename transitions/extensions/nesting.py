@@ -180,9 +180,9 @@ class NestedState(State):
     dynamic_methods = State.dynamic_methods + ["on_final"]
 
     def __init__(self, name, on_enter=None, on_exit=None, ignore_invalid_triggers=None, final=False, initial=None,
-                 on_final=None):
+                 on_final=None, defer=None):
         super(NestedState, self).__init__(name=name, on_enter=on_enter, on_exit=on_exit,
-                                          ignore_invalid_triggers=ignore_invalid_triggers, final=final)
+                                          ignore_invalid_triggers=ignore_invalid_triggers, final=final, defer=defer)
         self.initial = initial
         self.events = {}
         self.states = OrderedDict()
@@ -905,6 +905,39 @@ class HierarchicalMachine(Machine):
         event_data = NestedEventData(state=None, event=None, machine=self, model=model, args=args, kwargs=kwargs)
         event_data.result = None
 
+        if self._is_deferred(trigger, model):
+            self._defer_event(trigger, event_data)
+            return True
+
+        return self._process(partial(self._trigger_event, event_data, trigger))
+
+    def _is_deferred(self, trigger, model):
+        """Check whether the passed event is deferred for the model's current state(s).
+        An event is considered deferred when at least one currently active state declares it.
+        Declarations are inherited from parent states to their children, so a declaration on
+        a parent state also defers the event while any of its substates is active. In parallel
+        regions the event stays deferred as long as ANY region's active state (or one of its
+        parents) declares it; it is replayed once no active state defers it anymore.
+        Args:
+            trigger (str): Name of the event to check.
+            model (object): The model whose current states should be checked.
+        Returns: boolean indicating whether the event should be deferred.
+        """
+        with self():
+            state_tree = self.build_state_tree(listify(getattr(model, self.model_attribute)),
+                                               self.state_cls.separator)
+            to_check = [([], state_tree)]
+            while to_check:
+                prefix, tree = to_check.pop()
+                for state_name, subtree in tree.items():
+                    path = prefix + [state_name]
+                    if trigger in self.get_state(self.state_cls.separator.join(path)).defer:
+                        return True
+                    to_check.append((path, subtree))
+            return False
+
+    def _trigger_deferred(self, trigger, event_data):
+        """Re-submit a previously deferred event for processing."""
         return self._process(partial(self._trigger_event, event_data, trigger))
 
     def _trigger_event(self, event_data, trigger):

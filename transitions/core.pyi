@@ -35,6 +35,7 @@ class MachineConfig(TypedDict, total=False):
     model_attribute: str
     on_exception: CallbacksArg
     on_final: CallbacksArg
+    max_deferred: int
 
 
 def listify(obj: Union[None, List[Any], Tuple[Any], EnumMeta, Any]) -> Union[List[Any], Tuple[Any], EnumMeta]: ...
@@ -48,8 +49,10 @@ class State:
     ignore_invalid_triggers: bool
     on_enter: CallbackList
     on_exit: CallbackList
+    defer: List[str]
     def __init__(self, name: Union[str, Enum], on_enter: CallbacksArg = ..., on_exit: CallbacksArg = ...,
-                 ignore_invalid_triggers: bool = ..., final: bool = ...) -> None: ...
+                 ignore_invalid_triggers: bool = ..., final: bool = ...,
+                 defer: Optional[Union[str, List[str]]] = ...) -> None: ...
     @property
     def name(self) -> str: ...
     @property
@@ -143,6 +146,8 @@ class Machine:
     self_literal: Literal['self']
     _queued: bool
     _transition_queue: Deque[CallbackFunc]
+    _deferred_queue: Deque[Tuple[str, EventData]]
+    _replaying_deferred: bool
     _before_state_change: CallbackList
     _after_state_change: CallbackList
     _prepare_event: CallbackList
@@ -157,6 +162,7 @@ class Machine:
     name: str
     model_attribute: str
     model_override: bool
+    max_deferred: Optional[int]
     models: List[Any]
     def __init__(self, model: Optional[ModelParameter] = ...,
                  states: Optional[Union[Sequence[StateConfig], Type[Enum]]] = ...,
@@ -168,7 +174,8 @@ class Machine:
                  name: str = ..., queued: bool = ...,
                  prepare_event: CallbacksArg = ..., finalize_event: CallbacksArg = ...,
                  model_attribute: str = ..., model_override: bool = ...,
-                 on_exception: CallbacksArg = ..., on_final: CallbacksArg = ..., **kwargs: Any) -> None: ...
+                 on_exception: CallbacksArg = ..., on_final: CallbacksArg = ...,
+                 max_deferred: Optional[int] = ..., **kwargs: Any) -> None: ...
     def add_model(self, model: ModelParameter,
                   initial: Optional[StateIdentifier] = ...) -> None: ...
     def remove_model(self, model: ModelParameter) -> None: ...
@@ -246,6 +253,10 @@ class Machine:
     @staticmethod
     def resolve_callable(func: Callback, event_data: EventData) -> CallbackFunc:  ...
     def _has_state(self, state: StateIdentifier, raise_error: bool = ...) -> bool: ...
+    def _is_deferred(self, trigger: str, model: object) -> bool: ...
+    def _defer_event(self, trigger: str, event_data: EventData) -> None: ...
+    def _process_deferred(self) -> None: ...
+    def _trigger_deferred(self, trigger: str, event_data: EventData) -> bool: ...
     def _process(self, trigger: Callable[[], bool]) -> bool: ...
     def _identify_callback(self, name: str) -> Tuple[Optional[str], Optional[str]]: ...
     def __getattr__(self, name: str) -> Any: ...

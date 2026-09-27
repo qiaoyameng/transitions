@@ -2,6 +2,7 @@
 
 ## 0.9.4 ()
 
+- Feature: States can declare `defer` to postpone events until the state is left; deferred events are stored in a dedicated queue (limited by `Machine(max_deferred=...)`) and replayed in submission order; supported by `Machine` and `HierarchicalMachine`
 - Bug #688: `Machine.remove_transitions` did not work with `State` and `Enum` even though the signature implied this (thanks @hookokoko)
 - PR #696: Improve handling of `StrEnum` which were previously confused as string (thanks @jbrocher)
 - Bug #697: An empty string as a destination made a transition internal but only `dest=None` should do this (thanks @rudy-lath-vizio)

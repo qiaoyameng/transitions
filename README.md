@@ -40,6 +40,7 @@ A lightweight, object-oriented state machine implementation in Python with many 
     - [Internal transitions](#internal-transitions)
     - [Ordered transitions](#ordered-transitions)
     - [Queued transitions](#queued-transitions)
+    - [Deferred events](#deferred-events)
     - [Conditional transitions](#conditional-transitions)
     - [Check transitions](#check-transitions)
     - [Callbacks](#transition-callbacks)
@@ -758,6 +759,34 @@ class Model:
     def on_enter_B(self):
         self.to_C()  # add event to queue ...
         self.machine.remove_model(self)  # aaaand it's gone
+```
+
+#### <a name="deferred-events"></a>Deferred events
+
+Sometimes an event should not be processed right away but only after the model left a certain state -- for instance, when a device is being calibrated and incoming commands should be kept until calibration is done. States can declare such events with the `defer` keyword. Deferred events are stored in a dedicated deferred queue (separate from the queue used by `queued=True`) and are replayed in submission order once no active state defers them anymore. Event arguments are preserved as submitted and a deferred trigger call returns `True` since the event has been accepted for later processing.
+
+```python
+from transitions import Machine
+
+states = [{'name': 'calibrating', 'defer': ['configure']}, 'idle', 'ready']
+machine = Machine(states=states, initial='calibrating')
+machine.add_transition('finish_calibration', 'calibrating', 'idle')
+machine.add_transition('configure', 'idle', 'ready')
+
+machine.configure(mode='fast')  # deferred; nothing happens yet
+machine.state
+>>> 'calibrating'
+machine.finish_calibration()  # -> 'idle'; the deferred event is replayed ...
+machine.state
+>>> 'ready'                   # ... with the originally passed arguments
+```
+
+An event stays deferred as long as the current state defers it; it is not re-submitted in a loop while the state does not change. For `HierarchicalMachine`, `defer` declarations are inherited from parent states to their children, so an event declared on a parent state is also deferred while any of its substates is active. In parallel regions, an event stays deferred as long as ANY region's active state (or one of its parents) defers it and is replayed once no region requires deferral anymore.
+
+The number of stored deferred events can be limited with the `max_deferred` parameter of `Machine`. When the limit is reached, the oldest deferred event is discarded (and a warning is logged) to make room for the newly submitted event. When a model is removed from the machine, its deferred events are removed as well.
+
+```python
+machine = Machine(states=states, initial='calibrating', max_deferred=100)
 ```
 
 #### <a name="conditional-transitions"></a>Conditional transitions
