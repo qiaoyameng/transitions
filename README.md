@@ -1657,6 +1657,52 @@ machine.final_Z()
 # >>> Machine is final!
 ```
 
+##### History states
+
+A `HierarchicalMachine` can remember the last active substate configuration of a nested state with `HistoryState` pseudo states.
+When a transition targets a history state, the machine re-enters the states that have been active when the parent scope has been exited last instead of the scope's configured `initial` state(s).
+A *shallow* history state (`HistoryState('name')`) only restores the direct children of its parent scope and enters their `initial` substates while a *deep* history state (`HistoryState('name', deep=True)`) restores the entire previously active subtree, including nested and parallel states.
+If no history has been recorded yet, the configured `initial` state(s) of the parent scope are used as a fallback.
+History is tracked per model, so multiple models of the same machine do not interfere with each other.
+Internal transitions do not exit states and therefore do not alter the recorded history.
+
+```python
+from transitions.extensions import HierarchicalMachine, HistoryState
+
+states = [
+    {'name': 'on', 'initial': 'idle', 'children': [
+        'idle',
+        {'name': 'active', 'parallel': [
+            {'name': 'display', 'children': ['dim', 'bright'], 'initial': 'dim'},
+            {'name': 'radio', 'children': ['offline', 'online'], 'initial': 'offline'},
+        ]},
+        HistoryState('history', deep=True),
+    ]},
+    'suspended',
+]
+
+transitions = [
+    {'trigger': 'start_work', 'source': 'on_idle', 'dest': 'on_active'},
+    {'trigger': 'brighten', 'source': 'on_active_display_dim', 'dest': 'on_active_display_bright'},
+    {'trigger': 'connect', 'source': 'on_active_radio_offline', 'dest': 'on_active_radio_online'},
+    {'trigger': 'suspend', 'source': 'on', 'dest': 'suspended'},
+    {'trigger': 'resume', 'source': 'suspended', 'dest': 'on_history'},
+]
+
+device = HierarchicalMachine(states=states, transitions=transitions, initial='on')
+device.start_work()
+device.brighten()
+device.connect()
+print(device.state)
+# >>> ['on_active_display_bright', 'on_active_radio_online']
+device.suspend()
+device.resume()  # deep history restores 'bright' and 'online', not the defaults
+print(device.state)
+# >>> ['on_active_display_bright', 'on_active_radio_online']
+```
+
+A runnable version of this device workflow can be found in `examples/device_pause_resume.py`.
+
 ##### Reuse of previously created HSMs
 
 Besides semantic order, nested states are very handy if you want to specify state machines for specific tasks and plan to reuse them.

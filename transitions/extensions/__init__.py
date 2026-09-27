@@ -8,7 +8,7 @@ and made easier to access with a convenience factory.
 """
 
 from .diagrams import GraphMachine, HierarchicalGraphMachine
-from .nesting import HierarchicalMachine
+from .nesting import HierarchicalMachine, HistoryState
 from .locking import LockedMachine
 
 from .factory import MachineFactory, LockedHierarchicalGraphMachine

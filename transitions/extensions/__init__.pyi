@@ -4,6 +4,5 @@ from .factory import AsyncGraphMachine as AsyncGraphMachine, HierarchicalAsyncGr
 from .factory import MachineFactory as MachineFactory, LockedHierarchicalGraphMachine as LockedHierarchicalGraphMachine
 from .factory import LockedHierarchicalMachine as LockedHierarchicalMachine, LockedGraphMachine as LockedGraphMachine
 from .locking import LockedMachine as LockedMachine
-from .nesting import HierarchicalMachine as HierarchicalMachine
-
+from .nesting import HierarchicalMachine as HierarchicalMachine, HistoryState as HistoryState
 
