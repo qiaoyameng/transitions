@@ -1,6 +1,6 @@
 from ..core import CallbackFunc, Event, EventData, Machine, State, Transition, CallbacksArg, Callback, ModelParameter, TransitionConfig
 from collections import defaultdict as defaultdict
-from typing import OrderedDict, Sequence, Union, List, Dict, Optional, Type, Tuple, Callable, Any, Collection
+from typing import OrderedDict, Sequence, Union, List, Dict, Optional, Type, Tuple, Callable, Any, Collection, Set
 from types import TracebackType
 from logging import Logger
 from enum import Enum
@@ -27,6 +27,7 @@ class NestedEventData(EventData):
     transition: Optional[NestedTransition]
     source_name: Optional[str]
     source_path: Optional[List[str]]
+    checked_transitions: Set[int]
 
 
 class NestedState(State):
@@ -55,6 +56,11 @@ def _build_state_list(state_tree: StateTree, separator: str,
 def resolve_order(state_tree: Dict[str, str]) -> List[List[str]]: ...
 
 class NestedTransition(Transition):
+    sources: List[str]
+    destinations: List[str]
+    @property
+    def synchronized(self) -> bool: ...
+    def is_active_configuration(self, event_data: NestedEventData) -> bool: ...
     def _resolve_transition(self, event_data: NestedEventData) -> Tuple[StateTree, List[Callable[[], None]], List[Callable[[], Any]]]: ...
     def _change_state(self, event_data: NestedEventData) -> None: ...  # type: ignore[override]
     def _enter_nested(self, root: List[str], dest: List[str], prefix_path: List[str],

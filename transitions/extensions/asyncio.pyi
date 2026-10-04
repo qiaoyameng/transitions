@@ -2,8 +2,8 @@ from ..core import Callback, Condition, Event, EventData, Machine, State, Transi
     TransitionConfigList
 from .nesting import HierarchicalMachine, NestedEvent, NestedState, NestedTransition, NestedEventData, \
     NestedStateConfig, NestedStateIdentifier
-from typing import Any, Awaitable, Optional, List, Type, Dict, Deque, Callable, Union, Iterable, DefaultDict, Literal, \
-    Sequence, Coroutine, Required, TypedDict, Collection
+from typing import Any, Awaitable, Optional, List, Type, Dict, Deque, Callable, Union, Iterable, DefaultDict, \
+    Literal, Sequence, Coroutine, Required, TypedDict, Collection, Set
 from asyncio import Task
 from logging import Logger
 from enum import Enum
@@ -59,6 +59,7 @@ class AsyncEventData(EventData):
     transition: AsyncTransition
     source_name: Optional[str]
     source_path: Optional[List[str]]
+    checked_transitions: Set[int]
 
 class NestedAsyncEventData(NestedEventData, AsyncEventData):
     machine: HierarchicalAsyncMachine

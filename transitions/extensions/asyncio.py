@@ -172,6 +172,10 @@ class NestedAsyncTransition(AsyncTransition, NestedTransition):
 class AsyncEventData(EventData):
     """A redefinition of the base EventData intended to easy type checking."""
 
+    def __init__(self, state, event, machine, model, args, kwargs):
+        super(AsyncEventData, self).__init__(state, event, machine, model, args, kwargs)
+        self.checked_transitions = set()
+
 
 class AsyncEvent(Event):
     """A collection of transitions assigned to the same trigger"""
@@ -246,7 +250,7 @@ class NestedAsyncEvent(NestedEvent):
         event_data.event = self
         for state_path in ordered_states:
             state_name = machine.state_cls.separator.join(state_path)
-            if state_name not in done and state_name in self.transitions:
+            if state_name not in done and self.transitions.get(state_name):
                 event_data.state = machine.get_state(state_name)
                 event_data.source_name = state_name
                 event_data.source_path = copy.copy(state_path)
@@ -262,10 +266,15 @@ class NestedAsyncEvent(NestedEvent):
         machine = event_data.machine
         await machine.callbacks(event_data.machine.prepare_event, event_data)
         _LOGGER.debug("%sExecuted machine preparation callbacks before conditions.", machine.name)
+        event_data.result = False
 
         for trans in self.transitions[event_data.source_name]:
+            trans_id = id(trans)
+            if trans_id in event_data.checked_transitions or not trans.is_active_configuration(event_data):
+                continue
             event_data.transition = trans
             event_data.result = await trans.execute(event_data)
+            event_data.checked_transitions.add(trans_id)
             if event_data.result:
                 break
 

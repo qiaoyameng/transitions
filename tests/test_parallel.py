@@ -263,6 +263,117 @@ class TestParallel(TestNested):
         assert m.is_P_2(allow_substates=True)
         assert not m.is_A(allow_substates=True)
 
+    def test_synchronized_order_join(self):
+        class OrderModel(object):
+            def __init__(self):
+                self.calls = []
+
+            def _record(self, name):
+                self.calls.append(name)
+
+            def on_enter_order_payment_ready(self):
+                self._record('enter_payment_ready')
+
+            def on_exit_order_payment_pending(self):
+                self._record('exit_payment_pending')
+
+            def on_enter_order_stock_ready(self):
+                self._record('enter_stock_ready')
+
+            def on_exit_order_stock_pending(self):
+                self._record('exit_stock_pending')
+
+            def on_enter_idle(self):
+                self._record('enter_idle')
+
+            def on_exit_order_payment_ready(self):
+                self._record('exit_payment_ready')
+
+            def on_exit_order_stock_ready(self):
+                self._record('exit_stock_ready')
+
+            def on_exit_order(self):
+                self._record('exit_order')
+
+        states = ['idle', {'name': 'order', 'parallel': [
+            {'name': 'payment', 'children': ['pending', 'ready'], 'initial': 'pending'},
+            {'name': 'stock', 'children': ['pending', 'ready'], 'initial': 'pending'}
+        ]}]
+        model = OrderModel()
+        machine = self.machine_cls(model=model, states=states, initial='idle', auto_transitions=False)
+        machine.add_transition('pay', (['order_payment_pending', 'order_stock_pending'],),
+                               ['order_payment_ready', 'order_stock_pending'],
+                               conditions=lambda: model.calls.append('condition') or True)
+        machine.add_transition('prepare_stock', (['order_payment_ready', 'order_stock_pending'],),
+                               ['order_payment_ready', 'order_stock_ready'])
+        machine.add_transition('ship', (['order_payment_ready', 'order_stock_ready'],), 'idle')
+        machine.add_transition('start_order', 'idle', 'order')
+
+        model.start_order()
+        model.calls[:] = []
+
+        self.assertTrue(model.trigger('pay'))
+        self.assertEqual(['order_payment_ready', 'order_stock_pending'], model.state)
+        self.assertEqual(['condition', 'exit_payment_pending', 'enter_payment_ready'], model.calls)
+        self.assertIn('order_stock_pending', model.state)
+        self.assertFalse(model.may_pay())
+        self.assertEqual(['condition', 'exit_payment_pending', 'enter_payment_ready'], model.calls)
+
+        self.assertTrue(model.prepare_stock())
+        self.assertEqual(['order_payment_ready', 'order_stock_ready'], model.state)
+        self.assertEqual(['condition', 'exit_payment_pending', 'enter_payment_ready',
+                          'exit_stock_pending', 'enter_stock_ready'], model.calls)
+
+        model.calls[:] = []
+        self.assertTrue(model.ship())
+        self.assertEqual('idle', model.state)
+        self.assertEqual(['exit_payment_ready', 'exit_stock_ready',
+                          'exit_order', 'enter_idle'], model.calls)
+
+    def test_synchronized_models_use_independent_configurations(self):
+        states = ['idle', {'name': 'order', 'parallel': [
+            {'name': 'payment', 'children': ['pending', 'ready'], 'initial': 'pending'},
+            {'name': 'stock', 'children': ['pending', 'ready'], 'initial': 'pending'}
+        ]}]
+        first = type('ModelOne', (), {})()
+        second = type('ModelTwo', (), {})()
+        machine = self.machine_cls(model=[first, second], states=states, initial='order', auto_transitions=False)
+        machine.add_transition('pay', [['order_payment_pending', 'order_stock_pending']],
+                               ['order_payment_ready', 'order_stock_pending'])
+        machine.set_state(['order_payment_ready', 'order_stock_pending'], model=first)
+
+        self.assertFalse(first.may_pay())
+        self.assertEqual(['order_payment_ready', 'order_stock_pending'], first.state)
+        self.assertTrue(second.pay())
+        self.assertEqual(['order_payment_ready', 'order_stock_pending'], second.state)
+
+    def test_synchronized_invalid_configuration(self):
+        states = ['idle', {'name': 'order', 'parallel': [
+            {'name': 'payment', 'children': ['pending', 'ready'], 'initial': 'pending'},
+            {'name': 'stock', 'children': ['pending', 'ready'], 'initial': 'pending'}
+        ]}]
+        machine = self.machine_cls(states=states, initial='idle', auto_transitions=False)
+
+        with self.assertRaises(ValueError):
+            machine.add_transition('pay', [['order_payment_pending', 'order_payment_ready']],
+                                   ['order_payment_ready', 'order_stock_pending'])
+        with self.assertRaises(ValueError):
+            machine.add_transition('fork', 'idle',
+                                   ['order_payment_pending', 'order_payment_ready'])
+
+    def test_synchronized_fork(self):
+        states = ['idle', {'name': 'order', 'parallel': [
+            {'name': 'payment', 'children': ['pending', 'ready'], 'initial': 'pending'},
+            {'name': 'stock', 'children': ['pending', 'ready'], 'initial': 'pending'}
+        ]}]
+        model = type('OrderModel', (), {})()
+        machine = self.machine_cls(model=model, states=states, initial='idle', auto_transitions=False)
+        machine.add_transition('start_order', 'idle',
+                               ['order_payment_pending', 'order_stock_pending'])
+
+        self.assertTrue(model.start_order())
+        self.assertEqual(['order_payment_pending', 'order_stock_pending'], model.state)
+
 
 @skipIf(pgv is None, "pygraphviz is not available")
 class TestParallelWithPyGraphviz(TestParallel):
