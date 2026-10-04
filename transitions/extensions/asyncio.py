@@ -40,6 +40,19 @@ CANCELLED_MSG = "_transition"
 class AsyncState(State):
     """A persistent representation of a state managed by a ``Machine``. Callback execution is done asynchronously."""
 
+    activity = None
+
+    def __init__(self, *args, **kwargs):
+        """
+        Args:
+            **kwargs: If kwargs contain 'activity', assign an (async) callable to be executed in a dedicated
+                task while the state is active. The activity is started when the state has been entered and
+                is cancelled (and awaited) when the state is exited. Activities are tracked per model and
+                state by the machine, so a shared state definition keeps individual activities per model.
+        """
+        self.activity = kwargs.pop('activity', getattr(self, 'activity', None))
+        super().__init__(*args, **kwargs)
+
     async def enter(self, event_data):
         """Triggered when a state is entered.
         Args:
@@ -48,6 +61,8 @@ class AsyncState(State):
         _LOGGER.debug("%sEntering state %s. Processing callbacks...", event_data.machine.name, self.name)
         await event_data.machine.callbacks(self.on_enter, event_data)
         _LOGGER.info("%sFinished processing state %s enter callbacks.", event_data.machine.name, self.name)
+        if self.activity is not None:
+            event_data.machine.start_activity(self, event_data)
 
     async def exit(self, event_data):
         """Triggered when a state is exited.
@@ -55,12 +70,18 @@ class AsyncState(State):
             event_data: (AsyncEventData): The currently processed event.
         """
         _LOGGER.debug("%sExiting state %s. Processing callbacks...", event_data.machine.name, self.name)
+        if self.activity is not None:
+            await event_data.machine.stop_activity(self, event_data.model)
         await event_data.machine.callbacks(self.on_exit, event_data)
         _LOGGER.info("%sFinished processing state %s exit callbacks.", event_data.machine.name, self.name)
 
 
 class NestedAsyncState(NestedState, AsyncState):
     """A state that allows substates. Callback execution is done asynchronously."""
+
+    def __init__(self, *args, **kwargs):
+        self.activity = kwargs.pop('activity', None)
+        super().__init__(*args, **kwargs)
 
     async def scoped_enter(self, event_data, scope=None):
         self._scope = scope or []
@@ -325,6 +346,9 @@ class AsyncMachine(Machine):
 
         self._transition_queue_dict = _DictionaryMock(self._transition_queue) if queued is True else {}
         self._queued = queued
+        # tracks running state activities; keyed by (id(model), scoped state name) to make sure
+        # activities belong to a specific model's current stay in a specific state
+        self.activity_tasks = {}
         for model in listify(model):
             self.add_model(model)
 
@@ -406,6 +430,88 @@ class AsyncMachine(Machine):
                 _LOGGER.debug("Cancel running tasks...")
                 running_task.cancel(msg or CANCELLED_MSG)
 
+    def start_activity(self, state, event_data):
+        """Starts the activity assigned to a state in a dedicated task for the currently processed model.
+        The task is stored in `self.activity_tasks` and its identity acts as a generation marker:
+        completion notifications of superseded or cancelled activities are ignored.
+        Args:
+            state (AsyncState): The state whose activity should be started.
+            event_data (AsyncEventData): The currently processed event.
+        """
+        model = event_data.model
+        key = (id(model), state.name)
+        previous = self.activity_tasks.pop(key, None)
+        if previous is not None and not previous.done():
+            _LOGGER.debug("%sState %s has a lingering activity. Cancel it...", self.name, key[1])
+            previous.cancel()
+        activity_task = asyncio.ensure_future(self._run_activity(state, event_data))
+        self.activity_tasks[key] = activity_task
+        activity_task.add_done_callback(partial(self._finalize_activity, key, model, state.name))
+
+    async def stop_activity(self, state, model):
+        """Cancels the activity of a state for the passed model and waits for it to finish its cleanup.
+        Args:
+            state (AsyncState): The state whose activity should be stopped.
+            model (object): The model the activity belongs to.
+        """
+        key = (id(model), state.name)
+        activity_task = self.activity_tasks.pop(key, None)
+        if activity_task is None:
+            return
+        if not activity_task.done():
+            activity_task.cancel()
+        try:
+            await activity_task
+        except asyncio.CancelledError:
+            if not activity_task.cancelled():
+                # the task awaiting the activity (rather than the activity itself) has been cancelled
+                raise
+        except Exception as err:  # pylint: disable=broad-except
+            _LOGGER.warning("%sActivity of state %s raised %s during cleanup.", self.name, key[1], repr(err))
+
+    async def _run_activity(self, state, event_data):
+        func = self.resolve_callable(state.activity, event_data)
+        res = func(event_data) if self.send_event else func(*event_data.args, **event_data.kwargs)
+        if inspect.isawaitable(res):
+            return await res
+        return res
+
+    def _finalize_activity(self, key, model, state_name, activity_task):
+        """Done callback of an activity task. Converts the outcome into a machine event:
+        a finished activity triggers '<state>_activity_done', a failed one '<state>_activity_error'
+        on the model. Notifications of tasks that are no longer the current activity of the
+        (model, state) pair (e.g. after the state has been exited and re-entered) are ignored."""
+        if self.activity_tasks.get(key) is not activity_task:
+            _LOGGER.debug("%sIgnoring completion of a superseded activity of state %s.", self.name, key[1])
+            return
+        if activity_task.cancelled():
+            self.activity_tasks.pop(key, None)
+            return
+        error = activity_task.exception()
+        trigger = "{0}_activity_{1}".format(state_name, "error" if error is not None else "done")
+        asyncio.ensure_future(self._dispatch_activity(key, activity_task, trigger, model, error))
+
+    async def _dispatch_activity(self, key, activity_task, trigger, model, error):
+        # the state may have been exited (and re-entered) since the activity finished;
+        # only act on notifications of the still current generation
+        if self.activity_tasks.get(key) is not activity_task:
+            _LOGGER.debug("%sActivity event '%s' arrived too late and is discarded.", self.name, trigger)
+            return
+        self.activity_tasks.pop(key, None)
+        if trigger not in self.events:
+            if error is not None:
+                _LOGGER.warning("%sActivity of state %s failed with %s. Add a '%s' transition to handle it.",
+                                self.name, key[1], repr(error), trigger)
+            return
+        if model not in self.models:
+            return
+        try:
+            await getattr(model, trigger)()
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:  # pylint: disable=broad-except
+            _LOGGER.warning("%sProcessing activity event '%s' failed: %s", self.name, trigger, repr(err))
+
     async def process_context(self, func, model):
         """
         This function is called by an `AsyncEvent` to make callbacks processed in Event._trigger cancellable.
@@ -444,8 +550,15 @@ class AsyncMachine(Machine):
     def remove_model(self, model):
         """Remove a model from the state machine. The model will still contain all previously added triggers
         and callbacks, but will not receive updates when states or transitions are added to the Machine.
-        If an event queue is used, all queued events of that model will be removed."""
+        If an event queue is used, all queued events of that model will be removed.
+        Running state activities of the removed model(s) are cancelled; their cleanup is processed
+        asynchronously by the event loop."""
         models = listify(model)
+        for mod in models:
+            for key in [key for key in self.activity_tasks if key[0] == id(mod)]:
+                activity_task = self.activity_tasks.pop(key)
+                if not activity_task.done():
+                    activity_task.cancel()
         if self.has_queue == 'model':
             for mod in models:
                 del self._transition_queue_dict[id(mod)]

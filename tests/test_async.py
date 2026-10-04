@@ -13,7 +13,7 @@ except (ImportError, SyntaxError):
     asyncio = None  # type: ignore
 
 from unittest.mock import MagicMock
-from unittest import skipIf
+from unittest import skipIf, TestCase
 from functools import partial
 import weakref
 from .test_core import TestTransitions, MachineError, TYPE_CHECKING
@@ -843,3 +843,292 @@ class TestAsyncHierarchicalGraphMachine(TestHierarchicalAsync):
         super(TestHierarchicalAsync, self).setUp()
         self.machine_cls = HierarchicalAsyncGraphMachine  # type: Type[HierarchicalAsyncGraphMachine]
         self.machine = self.machine_cls(states=['A', 'B', 'C'], transitions=[['go', 'A', 'B']], initial='A')
+
+
+@skipIf(asyncio is None, "HierarchicalAsyncMachine requires asyncio and contextvars suppport")
+class TestAsyncStateActivity(TestCase):
+    """Tests for state activities of HierarchicalAsyncMachine. An activity is a coroutine started when
+    a state is entered and cancelled (with cleanup awaited) when the state is exited."""
+
+    def setUp(self):
+        self.machine_cls = HierarchicalAsyncMachine
+
+    @staticmethod
+    def blocking_activity(started, cleaned, block=None):
+        """Creates an activity that signals when it started and when its cleanup ran."""
+        async def activity():
+            started.set()
+            try:
+                await (block or asyncio.Event()).wait()
+            finally:
+                # make sure cleanup may itself contain asynchronous steps
+                await asyncio.sleep(0.01)
+                cleaned.set()
+        return activity
+
+    def test_activity_starts_on_enter_and_cleanup_awaited_on_exit(self):
+        async def run():
+            started, cleaned = asyncio.Event(), asyncio.Event()
+            machine = self.machine_cls(
+                states=['idle', {'name': 'connected',
+                                 'activity': self.blocking_activity(started, cleaned)}],
+                transitions=[['connect', 'idle', 'connected'], ['disconnect', 'connected', 'idle']],
+                initial='idle')
+            await machine.connect()
+            await asyncio.wait_for(started.wait(), timeout=1)
+            self.assertEqual(1, len(machine.activity_tasks))
+            await machine.disconnect()
+            # disconnect() only returns after the activity's cleanup has completed
+            self.assertTrue(cleaned.is_set())
+            self.assertEqual(0, len(machine.activity_tasks))
+        asyncio.run(run())
+
+    def test_activity_done_triggers_machine_event(self):
+        async def run():
+            finish, disconnected = asyncio.Event(), asyncio.Event()
+
+            async def heartbeat():
+                await finish.wait()
+
+            machine = self.machine_cls(
+                states=['idle', {'name': 'connected', 'activity': heartbeat},
+                        {'name': 'disconnected', 'on_enter': disconnected.set}],
+                transitions=[['connect', 'idle', 'connected'],
+                             ['connected_activity_done', 'connected', 'disconnected']],
+                initial='idle')
+            await machine.connect()
+            finish.set()
+            await asyncio.wait_for(disconnected.wait(), timeout=1)
+            self.assertTrue(machine.is_disconnected())
+            self.assertEqual(0, len(machine.activity_tasks))
+        asyncio.run(run())
+
+    def test_activity_error_triggers_machine_event(self):
+        async def run():
+            boom, failed = asyncio.Event(), asyncio.Event()
+
+            async def heartbeat():
+                await boom.wait()
+                raise RuntimeError("heartbeat lost")
+
+            machine = self.machine_cls(
+                states=['idle', {'name': 'connected', 'activity': heartbeat},
+                        {'name': 'failed', 'on_enter': failed.set}],
+                transitions=[['connect', 'idle', 'connected'],
+                             ['connected_activity_error', 'connected', 'failed']],
+                initial='idle')
+            await machine.connect()
+            boom.set()
+            await asyncio.wait_for(failed.wait(), timeout=1)
+            self.assertTrue(machine.is_failed())
+            self.assertEqual(0, len(machine.activity_tasks))
+        asyncio.run(run())
+
+    def test_activity_error_without_matching_event_is_logged(self):
+        async def run():
+            async def heartbeat():
+                raise RuntimeError("heartbeat lost")
+
+            machine = self.machine_cls(
+                states=['idle', {'name': 'connected', 'activity': heartbeat}],
+                transitions=[['connect', 'idle', 'connected']], initial='idle')
+            with self.assertLogs('transitions.extensions.asyncio', level='WARNING') as logged:
+                await machine.connect()
+                await asyncio.sleep(0.05)
+            self.assertTrue(any('connected_activity_error' in msg for msg in logged.output))
+            self.assertTrue(machine.is_connected())
+            self.assertEqual(0, len(machine.activity_tasks))
+        asyncio.run(run())
+
+    def test_activity_done_without_matching_event_is_ignored(self):
+        async def run():
+            async def heartbeat():
+                return None
+
+            machine = self.machine_cls(
+                states=['idle', {'name': 'connected', 'activity': heartbeat}],
+                transitions=[['connect', 'idle', 'connected']], initial='idle')
+            await machine.connect()
+            await asyncio.sleep(0.05)
+            self.assertTrue(machine.is_connected())
+            self.assertEqual(0, len(machine.activity_tasks))
+        asyncio.run(run())
+
+    def test_internal_transition_does_not_restart_activity(self):
+        async def run():
+            started, cleaned = asyncio.Event(), asyncio.Event()
+            machine = self.machine_cls(
+                states=['idle', {'name': 'connected',
+                                 'activity': self.blocking_activity(started, cleaned)}],
+                transitions=[['connect', 'idle', 'connected'],
+                             {'trigger': 'ping', 'source': 'connected', 'dest': None}],
+                initial='idle')
+            await machine.connect()
+            await asyncio.wait_for(started.wait(), timeout=1)
+            activity_task = machine.activity_tasks[(id(machine), 'connected')]
+            await machine.ping()
+            self.assertFalse(cleaned.is_set())
+            self.assertIs(machine.activity_tasks[(id(machine), 'connected')], activity_task)
+            await machine.to_idle()
+            self.assertTrue(cleaned.is_set())
+            self.assertEqual(0, len(machine.activity_tasks))
+        asyncio.run(run())
+
+    def test_quick_reentry_restarts_activity_and_ignores_stale_completion(self):
+        async def run():
+            gates = [asyncio.Event(), asyncio.Event()]
+            started, cleaned = [], []
+            done_mock = MagicMock()
+
+            async def activity():
+                generation = len(started)
+                started.append(generation)
+                try:
+                    await gates[generation].wait()
+                finally:
+                    cleaned.append(generation)
+
+            machine = self.machine_cls(
+                states=['idle', 'done', {'name': 'connected', 'activity': activity}],
+                transitions=[['connect', 'idle', 'connected'], ['drop', 'connected', 'idle'],
+                             {'trigger': 'connected_activity_done', 'source': 'connected', 'dest': 'done',
+                              'after': done_mock}],
+                initial='idle')
+            await machine.connect()
+            # let the first generation finish normally right before the state is exited
+            gates[0].set()
+            await asyncio.sleep(0)
+            await machine.drop()
+            self.assertEqual([0], cleaned)
+            await machine.connect()
+            await asyncio.sleep(0)
+            self.assertEqual([0, 1], started)
+            self.assertEqual(1, len(machine.activity_tasks))
+            # simulate a late completion notification of the first generation; it must not
+            # affect the second generation of the same state
+            stale_task = asyncio.ensure_future(asyncio.sleep(0))
+            await stale_task
+            machine._finalize_activity((id(machine), 'connected'), machine, 'connected', stale_task)
+            await asyncio.sleep(0.05)
+            self.assertFalse(done_mock.called)
+            self.assertTrue(machine.is_connected())
+            self.assertEqual([0], cleaned)
+            # the current generation is still cancelled and cleaned up on exit
+            await machine.drop()
+            self.assertEqual([0, 1], cleaned)
+            self.assertEqual(0, len(machine.activity_tasks))
+        asyncio.run(run())
+
+    def test_child_activity_cleaned_up_before_parent_activity(self):
+        async def run():
+            order = []
+            started = {'child': asyncio.Event(), 'parent': asyncio.Event()}
+
+            def make_activity(tag):
+                async def activity():
+                    started[tag].set()
+                    try:
+                        await asyncio.Event().wait()
+                    finally:
+                        order.append(tag)
+                return activity
+
+            states = ['idle', {'name': 'conn', 'activity': make_activity('parent'), 'initial': 'sub',
+                               'children': [{'name': 'sub', 'activity': make_activity('child')}]}]
+            machine = self.machine_cls(states=states, initial='idle',
+                                       transitions=[['connect', 'idle', 'conn'], ['drop', 'conn', 'idle']])
+            await machine.connect()
+            self.assertEqual(2, len(machine.activity_tasks))
+            await asyncio.wait_for(started['child'].wait(), timeout=1)
+            await asyncio.wait_for(started['parent'].wait(), timeout=1)
+            await machine.drop()
+            self.assertEqual(['child', 'parent'], order)
+            self.assertEqual(0, len(machine.activity_tasks))
+        asyncio.run(run())
+
+    def test_parallel_region_activities_stop_on_exit(self):
+        async def run():
+            started, cleaned = {}, []
+
+            def make_activity(tag):
+                started[tag] = asyncio.Event()
+
+                async def activity():
+                    started[tag].set()
+                    try:
+                        await asyncio.Event().wait()
+                    finally:
+                        cleaned.append(tag)
+                return activity
+
+            states = ['off', {'name': 'P', 'parallel': [
+                {'name': 'a', 'initial': 'a1', 'children': [{'name': 'a1', 'activity': make_activity('a')}]},
+                {'name': 'b', 'initial': 'b1', 'children': [{'name': 'b1', 'activity': make_activity('b')}]}]}]
+            machine = self.machine_cls(states=states, initial='off',
+                                       transitions=[['power', 'off', 'P'], ['shutdown', 'P', 'off']])
+            await machine.power()
+            await asyncio.wait_for(started['a'].wait(), timeout=1)
+            await asyncio.wait_for(started['b'].wait(), timeout=1)
+            self.assertEqual(2, len(machine.activity_tasks))
+            await machine.shutdown()
+            self.assertEqual(sorted(cleaned), ['a', 'b'])
+            self.assertTrue(machine.is_off())
+            self.assertEqual(0, len(machine.activity_tasks))
+        asyncio.run(run())
+
+    def test_activities_are_model_specific(self):
+        async def run():
+            class Device:
+                def __init__(self):
+                    self.started = asyncio.Event()
+                    self.cleaned = asyncio.Event()
+
+                async def heartbeat(self):
+                    self.started.set()
+                    try:
+                        await asyncio.Event().wait()
+                    finally:
+                        self.cleaned.set()
+
+            first, second = Device(), Device()
+            machine = self.machine_cls(
+                model=[first, second],
+                states=['idle', {'name': 'connected', 'activity': 'heartbeat'}],
+                transitions=[['connect', 'idle', 'connected'], ['disconnect', 'connected', 'idle']],
+                initial='idle')
+            await first.connect()
+            await second.connect()
+            await asyncio.wait_for(first.started.wait(), timeout=1)
+            await asyncio.wait_for(second.started.wait(), timeout=1)
+            self.assertEqual(2, len(machine.activity_tasks))
+            await first.disconnect()
+            self.assertTrue(first.cleaned.is_set())
+            self.assertFalse(second.cleaned.is_set())
+            self.assertTrue(second.is_connected())
+            self.assertEqual(1, len(machine.activity_tasks))
+            await second.disconnect()
+            self.assertTrue(second.cleaned.is_set())
+            self.assertEqual(0, len(machine.activity_tasks))
+        asyncio.run(run())
+
+    def test_remove_model_cancels_activity(self):
+        async def run():
+            started, cleaned = asyncio.Event(), asyncio.Event()
+
+            class Device:
+                pass
+
+            device = Device()
+            machine = self.machine_cls(
+                model=device,
+                states=['idle', {'name': 'connected',
+                                 'activity': self.blocking_activity(started, cleaned)}],
+                transitions=[['connect', 'idle', 'connected']], initial='idle')
+            await device.connect()
+            await asyncio.wait_for(started.wait(), timeout=1)
+            machine.remove_model(device)
+            # the machine's task collection is empty right away ...
+            self.assertEqual(0, len(machine.activity_tasks))
+            # ... while the actual cleanup is processed asynchronously by the event loop
+            await asyncio.wait_for(cleaned.wait(), timeout=1)
+        asyncio.run(run())

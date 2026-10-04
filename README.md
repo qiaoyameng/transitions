@@ -2225,6 +2225,44 @@ assert m.is_C()   # now timeout should have been processed
 
 You should consider passing `queued=True` to the `TimeoutMachine` constructor. This will make sure that events are processed sequentially and avoid asynchronous [racing conditions](https://github.com/pytransitions/transitions/issues/459) that may appear when timeout and event happen in proximity.
 
+#### <a name="async-state-activities"></a> State activities
+
+`AsyncMachine` and `HierarchicalAsyncMachine` can run an `activity` -- an (async) callable executed in a dedicated task -- while a state is active.
+The activity is started when the state has been entered and is cancelled (with its cleanup being awaited) when the state is exited.
+Activities are tracked per model and per stay in a state, so multiple models can be in the same state with individual activities, and re-entering a state starts a fresh activity.
+Since activities are bound to entering and exiting states, internal transitions do not restart them and activities of nested states are stopped before the activities of their parents.
+When an activity finishes on its own, this is converted into a machine event: a successfully finished activity of state `X` triggers `X_activity_done` on the model, a failed one triggers `X_activity_error`.
+If no such event has been defined, a finished activity is ignored and a failed one is logged as a warning.
+Completion notifications that arrive after the state has been exited (and possibly re-entered) are discarded.
+
+```python
+import asyncio
+from transitions.extensions.asyncio import HierarchicalAsyncMachine
+
+class Device:
+    async def read_heartbeat(self):
+        try:
+            while True:
+                await asyncio.sleep(1)  # wait for heartbeats
+        finally:
+            await self.close_connection()  # awaited before the exit completes
+
+    async def close_connection(self):
+        pass
+
+device = Device()
+machine = HierarchicalAsyncMachine(
+    model=device,
+    states=['idle', {'name': 'connected', 'activity': 'read_heartbeat'}, 'disconnected'],
+    transitions=[['connect', 'idle', 'connected'],
+                 ['disconnect', 'connected', 'idle'],
+                 # automatically disconnect when the heartbeat reader stops
+                 ['connected_activity_done', 'connected', 'disconnected']],
+    initial='idle')
+asyncio.run(device.connect())
+asyncio.run(device.disconnect())  # cancels read_heartbeat and awaits its cleanup
+```
+
 #### <a name="django-support"></a> Using transitions together with Django
 
 You can have a look at the [FAQ](examples/Frequently%20asked%20questions.ipynb) for some inspiration or checkout `django-transitions`.

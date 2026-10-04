@@ -2,6 +2,7 @@
 
 ## 0.9.4 ()
 
+- Feature: `AsyncMachine` and `HierarchicalAsyncMachine` support state activities -- (async) callables started in a dedicated task when a state is entered and cancelled (with awaited cleanup) when it is exited; finished activities trigger `<state>_activity_done` and failed ones `<state>_activity_error` on the model
 - Bug #688: `Machine.remove_transitions` did not work with `State` and `Enum` even though the signature implied this (thanks @hookokoko)
 - PR #696: Improve handling of `StrEnum` which were previously confused as string (thanks @jbrocher)
 - Bug #697: An empty string as a destination made a transition internal but only `dest=None` should do this (thanks @rudy-lath-vizio)
