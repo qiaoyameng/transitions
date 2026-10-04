@@ -1353,6 +1353,41 @@ model.foo()
 assert model.state == State.A
 ```
 
+### <a name="planning"></a> Offline transition-pair test plans
+
+Testing every transition once does not cover defects exposed by adjacent transitions, such as stopping a device and immediately restarting it.
+The experimental planner expands reachable deterministic configurations and builds plans for reachable pairs of consecutive unconditional transitions.
+Plans execute only real events; reset events are represented explicitly and do not silently restart the machine from an arbitrary state.
+Hierarchical and parallel machines are expanded into finite active configurations when possible, while conditions and unsupported behaviour are returned as coverage gaps.
+The heuristic planner may return multiple independently started plans and does not guarantee an optimal result.
+
+```python
+from transitions import Machine
+from transitions.experimental.planning import (
+    generate_transition_pair_plans, execute_plans, verify_coverage
+)
+
+machine = Machine(
+    states=["idle", "running", "stopped"],
+    transitions=[
+        ["start", "idle", "running"],
+        ["stop", "running", "stopped"],
+        ["restart", "stopped", "running"],
+        ["reset", "stopped", "idle"],
+    ],
+    initial="idle",
+)
+plan_set = generate_transition_pair_plans(
+    machine,
+    costs={"start": 1, "stop": 1, "restart": 1},
+    reset=("reset", 20),
+)
+executions = execute_plans(machine, plan_set.plans)
+required, missing = verify_coverage(executions, plan_set.pairs)
+assert not missing
+assert plan_set.optimal is False
+```
+
 ### <a name="extensions"></a> Extensions
 
 Even though the core of transitions is kept lightweight, there are a variety of MixIns to extend its functionality. Currently supported are:
