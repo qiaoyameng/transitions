@@ -56,6 +56,7 @@ A lightweight, object-oriented state machine implementation in Python with many 
     - [Threading](#threading)
     - [Async](#async)
     - [State features](#state-features)
+    - [Minimization](#minimization)
     - [Django](#django-support)
   - [Bug reports etc.](#bug-reports)
 
@@ -2224,6 +2225,36 @@ assert m.is_C()   # now timeout should have been processed
 ```
 
 You should consider passing `queued=True` to the `TimeoutMachine` constructor. This will make sure that events are processed sequentially and avoid asynchronous [racing conditions](https://github.com/pytransitions/transitions/issues/459) that may appear when timeout and event happen in proximity.
+
+#### <a name="minimization"></a> Minimizing deterministic machines
+
+`transitions.extensions.minimization` merges states that only differ by name but behave identically
+for every event of a fixed alphabet. It accepts unconditional transitions and explicit observable
+state labels. Enter, exit and transition callbacks are never executed; they participate in the
+comparison through stable identifiers returned by an `action_key` function. A missing transition is
+not treated as a self loop but as a transition into a uniform rejection sink.
+
+```python
+from transitions import Machine
+from transitions.extensions.minimization import minimize_machine
+
+machine = Machine(states=['A', 'B', 'C'], initial='A', auto_transitions=False,
+                  transitions=[
+                      {'trigger': 'go', 'source': 'A', 'dest': 'C'},
+                      {'trigger': 'go', 'source': 'B', 'dest': 'C'},
+                  ])
+
+result = minimize_machine(machine, events=['go', 'stop'],
+                          labels={'A': 'idle', 'B': 'idle', 'C': 'done'})
+result.mapping   # {'A': 'A', 'B': 'A', 'C': 'C'}
+result.machine   # quotient machine using the representative state names
+```
+
+`result.check_observations(n)` enumerates every event string up to length `n` and verifies that the
+original machine and the quotient emit the same observable sequences. `result.distinguish('A', 'C')`
+returns a shortest event string that separates two states (or `None` if they are equivalent) instead
+of merely stating that the states end up in different partitions. Conditional branches and multiple
+candidate transitions for the same `(state, event)` pair raise a `MinimizationError`.
 
 #### <a name="django-support"></a> Using transitions together with Django
 
