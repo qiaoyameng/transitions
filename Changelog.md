@@ -2,6 +2,8 @@
 
 ## 0.9.4 ()
 
+- Feature: Add experimental deterministic machine minimization (`transitions.experimental.minimization.minimize_machine`); it merges states with identical observable behavior, returns the quotient machine plus an original-state-to-representative mapping, refuses conditional branches and non-deterministic candidates, treats missing transitions as a uniform rejection distinct from self loops, and provides shortest distinguishing event strings and bounded quotient verification
+
 - Bug #688: `Machine.remove_transitions` did not work with `State` and `Enum` even though the signature implied this (thanks @hookokoko)
 - PR #696: Improve handling of `StrEnum` which were previously confused as string (thanks @jbrocher)
 - Bug #697: An empty string as a destination made a transition internal but only `dest=None` should do this (thanks @rudy-lath-vizio)
