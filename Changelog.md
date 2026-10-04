@@ -2,6 +2,7 @@
 
 ## 0.9.4 ()
 
+- Feature: Added `transitions.extensions.scxml`, a deliberately restricted SCXML adapter that converts vendor-supplied documents (states, parallel regions, initial and final states, transitions with events) into hierarchical state dictionaries and back; conditions and actions are only resolved from caller-provided mappings
 - Bug #688: `Machine.remove_transitions` did not work with `State` and `Enum` even though the signature implied this (thanks @hookokoko)
 - PR #696: Improve handling of `StrEnum` which were previously confused as string (thanks @jbrocher)
 - Bug #697: An empty string as a destination made a transition internal but only `dest=None` should do this (thanks @rudy-lath-vizio)
