@@ -1,4 +1,4 @@
-from ..core import CallbackFunc, Event, EventData, Machine, State, Transition, CallbacksArg, Callback, ModelParameter, TransitionConfig
+from ..core import CallbackFunc, Event, EventData, Machine, State, Transition, CallbacksArg, Callback, ModelParameter, TransitionConfig, MachineError
 from collections import defaultdict as defaultdict
 from typing import OrderedDict, Sequence, Union, List, Dict, Optional, Type, Tuple, Callable, Any, Collection
 from types import TracebackType
@@ -7,6 +7,14 @@ from enum import Enum
 from functools import partial
 
 _LOGGER: Logger
+
+EVENTLESS_TRIGGER: Any
+
+class StabilizationError(MachineError):
+    trace: List[Dict[str, Any]]
+    max_steps: Optional[int]
+    def __init__(self, value: str, trace: Optional[List[Dict[str, Any]]] = ...,
+                 max_steps: Optional[int] = ...) -> None: ...
 
 class FunctionWrapper:
     _func: Optional[CallbackFunc]
@@ -70,6 +78,7 @@ class HierarchicalMachine(Machine):
     state_cls: Type[NestedState]
     transition_cls: Type[NestedTransition]
     event_cls: Type[NestedEvent]
+    completion_condition_cls: Type[Any]
     # mypy does not approve State being overridden with NestedState and Event with NestedEvent
     states: OrderedDict[str, NestedState]  # type: ignore
     events: Dict[str, NestedEvent]  # type:ignore
@@ -77,6 +86,9 @@ class HierarchicalMachine(Machine):
     _initial: Optional[str]
     prefix_path: List[str]
     scoped: Union[NestedState, HierarchicalMachine]
+    stabilize: bool
+    max_stabilization_steps: int
+    stabilization_trace: List[Dict[str, Any]]
     def __init__(self, model: Optional[ModelParameter]=...,
                  states: Optional[Union[Sequence[NestedStateConfig], Type[Enum]]] = ...,
                  initial: Optional[NestedStateIdentifier] = ...,
@@ -86,7 +98,8 @@ class HierarchicalMachine(Machine):
                  before_state_change: CallbacksArg = ..., after_state_change: CallbacksArg = ...,
                  name: str = ..., queued: Union[bool, str] = ...,
                  prepare_event: CallbacksArg = ..., finalize_event: CallbacksArg = ...,
-                 model_attribute: str = ..., on_exception: CallbacksArg = ..., **kwargs: Any) -> None: ...
+                 model_attribute: str = ..., on_exception: CallbacksArg = ...,
+                 stabilize: bool = ..., max_stabilization_steps: int = ..., **kwargs: Any) -> None: ...
     _next_scope: Optional[ScopeTuple]
     def __call__(self, to_scope: Optional[Union[ScopeTuple, str, Enum]] = ...) -> HierarchicalMachine: ...
     def __enter__(self) -> None: ...
@@ -104,7 +117,13 @@ class HierarchicalMachine(Machine):
     def add_states(self, states: Union[List[NestedStateConfig], NestedStateConfig],  # type: ignore[override]
                    on_enter: CallbacksArg = ...,  on_exit: CallbacksArg = ...,
                    ignore_invalid_triggers: Optional[bool] = ..., **kwargs: Any) -> None: ...
-    def add_transition(self, trigger: str,  # type: ignore[override]
+    def add_eventless_transition(self,
+                       source: Union[NestedStateIdentifier, List[NestedStateIdentifier]],
+                       dest: Optional[NestedStateIdentifier] = ...,
+                       conditions: CallbacksArg = ...,
+                       unless: CallbacksArg = ..., before: CallbacksArg = ..., after: CallbacksArg = ...,
+                       prepare: CallbacksArg = ..., **kwargs: Any) -> None: ...
+    def add_transition(self, trigger: Optional[str],  # type: ignore[override]
                        source: Union[NestedStateIdentifier, List[NestedStateIdentifier]],
                        dest: Optional[NestedStateIdentifier] = ...,
                        conditions: CallbacksArg = ...,

@@ -9,6 +9,7 @@
 
 from collections import OrderedDict
 import copy
+import itertools
 from functools import partial, reduce
 import inspect
 import logging
@@ -30,6 +31,83 @@ from ..core import State, Machine, Transition, Event, listify, MachineError, Eve
 
 _LOGGER = logging.getLogger(__name__)
 _LOGGER.addHandler(logging.NullHandler())
+
+
+class _EventlessTrigger(object):
+    """Sentinel used as the trigger name of explicit eventless (completion) transitions.
+
+    Eventless transitions are not bound to models and must never be mistaken for an ordinary
+    external event. They are evaluated by ``HierarchicalMachine._stabilize`` until a stable
+    state configuration is reached.
+    """
+
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(_EventlessTrigger, cls).__new__(cls)
+        return cls._instance
+
+    def __repr__(self):
+        return "<eventless>"
+
+    def __str__(self):
+        # an empty string keeps the sentinel invisible in trigger lists and labels
+        return ""
+
+
+#: Unique key under which eventless transitions are stored in the scoped ``events`` dicts.
+EVENTLESS_TRIGGER = _EventlessTrigger()
+
+
+class StabilizationError(MachineError):
+    """Raised when a state configuration does not stabilize within the configured number
+    of microsteps (``max_stabilization_steps``).
+
+    This is deliberately distinct from a failed condition evaluation: every executed microstep
+    contained enabled eventless transitions, meaning the machine kept advancing instead of
+    reaching a stable configuration.
+
+    Attributes:
+        trace (list): List of microstep records. Each record is a dict with the active
+            ``states`` before the microstep and the ``transitions`` (source -> destination)
+            that were executed within it.
+        max_steps (int): The configured microstep limit that was exceeded.
+    """
+
+    def __init__(self, value, trace=None, max_steps=None):
+        super(StabilizationError, self).__init__(value)
+        self.trace = trace if trace is not None else []
+        self.max_steps = max_steps
+
+
+class _CompletionCondition(object):
+    """Internal condition ensuring eventless transitions leaving a composite/parallel state
+    are only enabled once every active region of that state has reached a final state.
+
+    This implements the "completion" semantics of UML statecharts: a leaf state is considered
+    complete as soon as it is entered, while a composite state is complete only when all of its
+    parallel regions (recursively) reside in final states.
+    """
+
+    target = True
+
+    def __init__(self, source_path):
+        self.source_path = source_path
+        self.func = "<completion of %s>" % source_path
+
+    def check(self, event_data):
+        machine = event_data.machine
+        source_path = self.source_path
+        if isinstance(source_path, str):
+            source_path = source_path.split(machine.state_cls.separator)
+        state_tree = machine.build_state_tree(
+            listify(getattr(event_data.model, machine.model_attribute)),
+            machine.state_cls.separator)
+        subtree = state_tree
+        for elem in source_path:
+            subtree = subtree.get(elem, {})
+        return machine._subtree_is_final(source_path, subtree)
 
 
 # converts a hierarchical tree into a list of current states
@@ -393,13 +471,17 @@ class HierarchicalMachine(Machine):
     state_cls = NestedState
     transition_cls = NestedTransition
     event_cls = NestedEvent
+    #: Condition class used to gate eventless transitions of composite/parallel sources.
+    #: Subclasses (such as the async machine) can replace this with an awaitable variant.
+    completion_condition_cls = _CompletionCondition
 
     def __init__(self, model=Machine.self_literal, states=None, initial='initial', transitions=None,
                  send_event=False, auto_transitions=True,
                  ordered_transitions=False, ignore_invalid_triggers=None,
                  before_state_change=None, after_state_change=None, name=None,
                  queued=False, prepare_event=None, finalize_event=None, model_attribute='state',
-                 model_override=False, on_exception=None, on_final=None, **kwargs):
+                 model_override=False, on_exception=None, on_final=None,
+                 stabilize=True, max_stabilization_steps=100, **kwargs):
         assert issubclass(self.state_cls, NestedState)
         assert issubclass(self.event_cls, NestedEvent)
         assert issubclass(self.transition_cls, NestedTransition)
@@ -407,6 +489,14 @@ class HierarchicalMachine(Machine):
         self.prefix_path = []
         self.scoped = self
         self._next_scope = None
+        # Whether the machine automatically advances through eventless transitions until a
+        # stable state configuration has been reached after every external event.
+        self.stabilize = stabilize
+        # Upper bound of microsteps performed in one stabilization run. If this limit is
+        # exceeded, a StabilizationError is raised containing the microsteps visited so far.
+        self.max_stabilization_steps = max_stabilization_steps
+        # Trace of the most recent stabilization run (a list of microstep records).
+        self.stabilization_trace = []
         super(HierarchicalMachine, self).__init__(
             model=model, states=states, initial=initial, transitions=transitions,
             send_event=send_event, auto_transitions=auto_transitions,
@@ -535,8 +625,86 @@ class HierarchicalMachine(Machine):
             else:
                 raise ValueError("Cannot add state of type {0}. ".format(type(state).__name__))
 
+    def add_eventless_transition(self, source, dest, conditions=None, unless=None,
+                                 before=None, after=None, prepare=None, **kwargs):
+        """Add an explicit eventless transition (also known as a completion transition).
+
+        Eventless transitions have no trigger. Once a source state is entered and all of its
+        conditions are met, the transition is executed automatically during stabilization
+        (see ``max_stabilization_steps``). When the source is a composite or parallel state,
+        the transition is only enabled once ALL its (parallel) substates have reached a final
+        state.
+
+        Args:
+            source (str or list): Source state name(s). ``Machine.wildcard_all`` ('*') is
+                supported and expanded to all currently known states.
+            dest (str): Destination state name. Relative names are resolved in the current
+                scope; ``Machine.wildcard_same`` ('=') marks a reflexive transition.
+            conditions (optional[str, callable or list]): Conditions evaluated per microstep.
+                Note that a failed condition does NOT disable the transition permanently; it
+                will be evaluated again after every subsequent microstep.
+            unless, before, after, prepare: See ``add_transition``.
+            **kwargs: Additional keyword arguments forwarded to the transition constructor.
+        """
+        # remember the scope the transition was declared in so relative names resolve correctly
+        scope_prefix = list(self.prefix_path)
+        if source == self.wildcard_all:
+            with self():
+                sources = self.get_nested_state_names()
+        else:
+            sources = listify(source)
+        transitions = []
+        for source_name in sources:
+            source_path = self.state_cls.separator.join(
+                self._get_enum_path(source_name)) if isinstance(source_name, Enum) else source_name
+            dest_name = self._globalize_name(source_path, dest, scope_prefix)
+            trans = self.transition_cls(source_path, dest_name, conditions=conditions, unless=unless,
+                                        before=before, after=after, prepare=prepare, **kwargs)
+            trans.eventless = True
+            # a composite/parallel source is only "complete" when every region of its
+            # active subconfiguration has reached a final state
+            source_state = self.get_state(source_path)
+            if getattr(source_state, 'states', None):
+                trans.conditions.append(self.completion_condition_cls(source_path))
+            transitions.append(trans)
+        # eventless transitions are registered at the machine root under a sentinel trigger.
+        # This way they are never exposed as model methods or ordinary external events.
+        with self():
+            if EVENTLESS_TRIGGER not in self.events:
+                self.events[EVENTLESS_TRIGGER] = self._create_event(EVENTLESS_TRIGGER, self)
+            event = self.events[EVENTLESS_TRIGGER]
+            for trans in transitions:
+                event.add_transition(trans)
+
+    def _globalize_name(self, source_path, dest, scope_prefix):
+        """Resolve a (possibly relative) destination name to a global state name."""
+        if dest == self.wildcard_same:
+            return source_path
+        if dest is None:
+            return None
+        dest_name = dest.name if hasattr(dest, 'name') else dest
+        separator = self.state_cls.separator
+        # validate the destination and prefer an already global name
+        try:
+            dest_state = self.get_state(dest_name)
+            with self():
+                global_path = self._get_state_path(dest_state)
+            if global_path:
+                return separator.join(global_path)
+        except ValueError:
+            global_path = None
+        # fall back to resolving a relative name within the declaring scope
+        candidate = separator.join(scope_prefix + [dest_name]) if scope_prefix else dest_name
+        self.get_state(candidate)
+        return candidate
+
     def add_transition(self, trigger, source, dest, conditions=None,
                        unless=None, before=None, after=None, prepare=None, **kwargs):
+        # ``trigger`` is ``None`` (or the internal sentinel) -> explicit eventless transition
+        if trigger is None or trigger is EVENTLESS_TRIGGER:
+            self.add_eventless_transition(source, dest, conditions=conditions, unless=unless,
+                                          before=before, after=after, prepare=prepare, **kwargs)
+            return
         if source == self.wildcard_all and dest == self.wildcard_same:
             source = self.get_nested_state_names()
         else:
@@ -587,6 +755,10 @@ class HierarchicalMachine(Machine):
         Returns:
             list(NestedTransitions) of valid transitions.
         """
+        if trigger == EVENTLESS_TRIGGER:
+            with self():
+                event = self.events.get(EVENTLESS_TRIGGER)
+                return list(itertools.chain.from_iterable(event.transitions.values())) if event else []
         if src_path and dest_path:
             src = self.state_cls.separator.join(src_path)
             dest = self.state_cls.separator.join(dest_path)
@@ -612,6 +784,10 @@ class HierarchicalMachine(Machine):
             for state_name in self.states:
                 with self(state_name):
                     transitions.extend(self.get_nested_transitions(trigger, None, None))
+        # eventless transitions are internal implementation details and must not show up in
+        # generic transition listings (graphs, markup, introspection)
+        if trigger == "":
+            transitions = [trans for trans in transitions if not getattr(trans, 'eventless', False)]
         return transitions
 
     def get_nested_triggers(self, src_path=None):
@@ -622,12 +798,13 @@ class HierarchicalMachine(Machine):
             list(str) of valid trigger names.
         """
         if src_path:
-            triggers = super(HierarchicalMachine, self).get_triggers(self.state_cls.separator.join(src_path))
+            triggers = [trig for trig in super(HierarchicalMachine, self).get_triggers(
+                self.state_cls.separator.join(src_path)) if trig != EVENTLESS_TRIGGER]
             if len(src_path) > 1 and src_path[0] in self.states:
                 with self(src_path[0]):
                     triggers.extend(self.get_nested_triggers(src_path[1:]))
         else:
-            triggers = list(self.events.keys())
+            triggers = [trig for trig in self.events.keys() if trig != EVENTLESS_TRIGGER]
             for state_name in self.states:
                 with self(state_name):
                     triggers.extend(self.get_nested_triggers())
@@ -756,6 +933,9 @@ class HierarchicalMachine(Machine):
 
         # remove trigger from models if no transition is left for trigger
         if not self.get_transitions(trigger):
+            if trigger == EVENTLESS_TRIGGER:
+                self.events.pop(EVENTLESS_TRIGGER, None)
+                return
             for model in self.models:
                 delattr(model, trigger)
 
@@ -809,8 +989,8 @@ class HierarchicalMachine(Machine):
                     with self(state_path[0]):
                         triggers.extend(self.get_nested_triggers(state_path[1:]))
                 while state_path:  # check all valid transitions for parent states
-                    triggers.extend(super(HierarchicalMachine, self).get_triggers(
-                        self.state_cls.separator.join(state_path)))
+                    triggers.extend(trig for trig in super(HierarchicalMachine, self).get_triggers(
+                        self.state_cls.separator.join(state_path)) if trig != EVENTLESS_TRIGGER)
                     state_path.pop()
         return triggers
 
@@ -883,7 +1063,10 @@ class HierarchicalMachine(Machine):
         else:
             event.source_name = current_state
             event.source_path = current_state.split(self.state_cls.separator)
-        self._create_transition(event.source_name, state_name).execute(event)
+        if self._create_transition(event.source_name, state_name).execute(event):
+            if self.stabilize and EVENTLESS_TRIGGER in self.events:
+                self._stabilize(event)
+        return event.result
 
     def trigger_event(self, model, trigger, *args, **kwargs):
         """Processes events recursively and forwards arguments if suitable events are found.
@@ -912,6 +1095,11 @@ class HierarchicalMachine(Machine):
             with self():
                 res = self._trigger_event_nested(event_data, trigger, None)
             event_data.result = self._check_event_result(res, event_data.model, trigger)
+            # run-to-completion: once the external event has been handled, all enabled
+            # eventless transitions are processed microstep by microstep until the
+            # configuration is stable. New external events are only handled afterwards.
+            if event_data.result and self.stabilize and EVENTLESS_TRIGGER in self.events:
+                self._stabilize(event_data)
         except BaseException as err:  # pylint: disable=broad-except; Exception will be handled elsewhere
             event_data.error = err
             if self.on_exception:
@@ -928,6 +1116,165 @@ class HierarchicalMachine(Machine):
                               type(err).__name__,
                               str(err))
         return event_data.result
+
+    def _stabilize(self, event_data):
+        """Repeatedly execute microsteps of enabled eventless transitions until no further
+        transition is enabled (stable configuration) or ``max_stabilization_steps`` is
+        reached. The microsteps and the transitions they execute are recorded in
+        ``self.stabilization_trace`` and reported when the limit is exceeded.
+        Args:
+            event_data (NestedEventData): Event data reused for every microstep.
+        Returns:
+            bool: True if at least one eventless transition was executed, False otherwise.
+        Raises:
+            StabilizationError: If eventless transitions remain enabled after
+                ``max_stabilization_steps`` microsteps (a genuinely non-converging
+                configuration such as an unconditional automatic loop).
+        """
+        any_fired = False
+        trace = []
+        step = 0
+        while step < self.max_stabilization_steps:
+            states_before = copy.copy(listify(getattr(event_data.model, self.model_attribute)))
+            fired = self._eventless_microstep(event_data)
+            if not fired:
+                break
+            any_fired = True
+            trace.append({
+                'step': step,
+                'states': states_before,
+                'transitions': [{'source': trans.source, 'dest': trans.dest} for trans in fired],
+            })
+            step += 1
+        if step >= self.max_stabilization_steps and fired:
+            msg = "%sState configuration did not stabilize within %s microstep(s)." % \
+                  (self.name, self.max_stabilization_steps)
+            _LOGGER.error("%s Last configuration: %s", msg,
+                          getattr(event_data.model, self.model_attribute))
+            self.stabilization_trace = trace
+            raise StabilizationError(msg, trace=trace, max_steps=self.max_stabilization_steps)
+        self.stabilization_trace = trace
+        return any_fired
+
+    def _eventless_microstep(self, event_data):
+        """Execute one microstep of eventless transitions.
+
+        States are visited deepest-first so that a transition enabled on a substate always
+        takes precedence over transitions enabled on its ancestors. All non-conflicting
+        transitions of parallel regions can be part of the same microstep; once a state has
+        been left (or one of its ancestors has), it is marked as 'done' and skipped together
+        with all of its ancestors for the remainder of the microstep.
+        Args:
+            event_data (NestedEventData): Event data used for this microstep.
+        Returns:
+            list(NestedTransition): The transitions that were executed in this microstep.
+        """
+        model = event_data.model
+        fired = []
+        state_tree = self.build_state_tree(listify(getattr(model, self.model_attribute)),
+                                           self.state_cls.separator)
+        done = set()
+        with self():
+            event = self.events.get(EVENTLESS_TRIGGER)
+        if event is None:
+            return fired
+        # a single global deepest-first traversal (reverse breadth-first order of the whole
+        # state tree) guarantees child precedence across scope boundaries
+        ordered_paths = [list(path) for path in resolve_order(copy.deepcopy(state_tree))]
+        # PHASE 1: determine the transitions enabled in this microstep. ALL condition
+        # checks (including the completion conditions of composite/parallel ancestors) are
+        # evaluated against the configuration at the beginning of the microstep. This keeps
+        # a parent completion transition from becoming enabled within the very same
+        # microstep in which its regions just reached their final states.
+        enabled = []
+        for state_path in ordered_paths:
+            state_name = self.state_cls.separator.join(state_path)
+            if state_name not in event.transitions:
+                continue
+            event_data.event = event
+            event_data.state = self.get_state(state_name)
+            event_data.source_name = state_name
+            event_data.source_path = copy.copy(state_path)
+            for trans in event.transitions[state_name]:
+                event_data.transition = trans
+                if trans._eval_conditions(event_data):
+                    enabled.append((state_path, trans))
+                    break
+        # PHASE 2: execute all non-conflicting enabled transitions in deepest-first order.
+        for state_path, trans in enabled:
+            state_name = self.state_cls.separator.join(state_path)
+            handled = any(
+                self.state_cls.separator.join(state_path[:idx]) in done
+                for idx in range(1, len(state_path) + 1))
+            if handled:
+                continue
+            # make sure the state is still part of the live configuration (it may have been
+            # left by a non-conflicting parallel transition earlier in this microstep)
+            live_branch = state_tree
+            for elem in state_path:
+                if elem not in live_branch:
+                    live_branch = None
+                    break
+                live_branch = live_branch[elem]
+            if live_branch is None:
+                continue
+            event_data.event = event
+            event_data.state = self.get_state(state_name)
+            event_data.source_name = state_name
+            event_data.source_path = copy.copy(state_path)
+            event_data.transition = trans
+            event_data.result = trans.execute(event_data)
+            fired.append(trans)
+            # conflict scope: the fired state and all ancestors up to (but not including)
+            # the nearest enclosing parallel state. Sibling regions of that parallel state
+            # are non-conflicting and may still be executed within this microstep.
+            start_len, end_len = self._eventless_conflict_boundary(state_path)
+            for prefix_len in range(start_len, end_len + 1):
+                done.add(self.state_cls.separator.join(state_path[:prefix_len]))
+            # rebuild the live configuration from the model since each transition
+            # resolves and updates its own state tree
+            state_tree = self.build_state_tree(
+                listify(getattr(model, self.model_attribute)),
+                self.state_cls.separator)
+        return fired
+
+    def _tree_path_is_final(self, path, subtree):
+        """Recursively determine whether the state located at ``path`` is in a final
+        configuration: a leaf state must itself be final while a composite/parallel state is
+        final iff every one of its child regions is in a final configuration.
+        """
+        if isinstance(path, str):
+            path = path.split(self.state_cls.separator)
+        return self._subtree_is_final(path, subtree)
+
+    def _subtree_is_final(self, path, subtree):
+        """Evaluate finality of ``subtree`` which is rooted at the state denoted by
+        ``path``. A leaf must itself be final; a composite/parallel state is final when
+        every one of its child regions is in a final configuration."""
+        if subtree:
+            for key, child_tree in subtree.items():
+                if not self._subtree_is_final(path + [key], child_tree):
+                    return False
+            return True
+        state = self.get_state(path)
+        return bool(getattr(state, 'final', False))
+
+    def _eventless_conflict_boundary(self, state_path):
+        """Return the inclusive range (start_len, end_len) of prefix lengths that conflict
+        with a transition firing from ``state_path``. All ancestors up to (but not including)
+        the nearest enclosing parallel state are part of the conflict scope; sibling regions
+        of that parallel state are not."""
+        start_len, end_len = 1, len(state_path)
+        for idx in range(1, len(state_path)):
+            with self():
+                scope = self
+                for elem in state_path[:idx]:
+                    scope = scope.states[elem]
+            if isinstance(getattr(scope, 'initial', None), (list, tuple)) \
+                    and len(scope.initial) > 1:
+                start_len = idx + 1
+                break
+        return start_len, end_len
 
     def _add_model_to_state(self, state, model):
         name = self.get_global_name(state)
@@ -1038,6 +1385,9 @@ class HierarchicalMachine(Machine):
             self._init_state(new_state)
 
     def _add_trigger_to_model(self, trigger, model):
+        if trigger == EVENTLESS_TRIGGER:
+            # eventless transitions are internal and must never be bound to a model
+            return
         trig_func = partial(self.trigger_event, model, trigger)
         self._add_may_transition_func_for_trigger(trigger, model)
         # FunctionWrappers are only necessary if a custom separator is used

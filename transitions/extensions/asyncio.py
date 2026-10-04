@@ -26,7 +26,8 @@ import copy
 
 from ..core import State, Condition, Transition, EventData, listify
 from ..core import Event, MachineError, Machine
-from .nesting import HierarchicalMachine, NestedState, NestedEvent, NestedTransition, resolve_order
+from .nesting import HierarchicalMachine, NestedState, NestedEvent, NestedTransition, resolve_order, \
+    EVENTLESS_TRIGGER, StabilizationError
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -515,6 +516,29 @@ class AsyncMachine(Machine):
         return True
 
 
+class AsyncCompletionCondition(object):
+    """Awaitable variant of nesting._CompletionCondition."""
+
+    target = True
+
+    def __init__(self, source_path):
+        self.source_path = source_path
+        self.func = "<completion of %s>" % source_path
+
+    async def check(self, event_data):
+        machine = event_data.machine
+        separator = machine.state_cls.separator
+        state_tree = machine.build_state_tree(
+            listify(getattr(event_data.model, machine.model_attribute)), separator)
+        source_path = self.source_path
+        if isinstance(source_path, str):
+            source_path = source_path.split(machine.state_cls.separator)
+        subtree = state_tree
+        for elem in source_path:
+            subtree = subtree.get(elem, {})
+        return machine._subtree_is_final(source_path, subtree)
+
+
 class HierarchicalAsyncMachine(HierarchicalMachine, AsyncMachine):
     """Asynchronous variant of transitions.extensions.nesting.HierarchicalMachine.
         An asynchronous hierarchical machine REQUIRES AsyncNestedStates, AsyncNestedEvent and AsyncNestedTransitions
@@ -524,6 +548,7 @@ class HierarchicalAsyncMachine(HierarchicalMachine, AsyncMachine):
     state_cls = NestedAsyncState
     transition_cls = NestedAsyncTransition
     event_cls = NestedAsyncEvent
+    completion_condition_cls = AsyncCompletionCondition
 
     async def trigger_event(self, model, trigger, *args, **kwargs):
         """Processes events recursively and forwards arguments if suitable events are found.
@@ -552,6 +577,8 @@ class HierarchicalAsyncMachine(HierarchicalMachine, AsyncMachine):
             with self():
                 res = await self._trigger_event_nested(event_data, trigger, None)
             event_data.result = self._check_event_result(res, event_data.model, trigger)
+            if event_data.result and self.stabilize and EVENTLESS_TRIGGER in self.events:
+                await self._stabilize(event_data)
         except BaseException as err:  # pylint: disable=broad-except; Exception will be handled elsewhere
             event_data.error = err
             if self.on_exception:
@@ -568,6 +595,89 @@ class HierarchicalAsyncMachine(HierarchicalMachine, AsyncMachine):
                               type(err).__name__,
                               str(err))
         return event_data.result
+
+    async def _stabilize(self, event_data):
+        """Asynchronous variant of ``HierarchicalMachine._stabilize``."""
+        any_fired = False
+        trace = []
+        step = 0
+        while step < self.max_stabilization_steps:
+            states_before = copy.copy(listify(getattr(event_data.model, self.model_attribute)))
+            fired = await self._eventless_microstep(event_data)
+            if not fired:
+                break
+            any_fired = True
+            trace.append({
+                'step': step,
+                'states': states_before,
+                'transitions': [{'source': trans.source, 'dest': trans.dest} for trans in fired],
+            })
+            step += 1
+        if step >= self.max_stabilization_steps and fired:
+            msg = "%sState configuration did not stabilize within %s microstep(s)." % \
+                  (self.name, self.max_stabilization_steps)
+            self.stabilization_trace = trace
+            raise StabilizationError(msg, trace=trace, max_steps=self.max_stabilization_steps)
+        self.stabilization_trace = trace
+        return any_fired
+
+    async def _eventless_microstep(self, event_data):
+        """Asynchronous variant of ``HierarchicalMachine._eventless_microstep`` following
+        the same two-phase (enable against a snapshot, then execute non-conflicting
+        transitions) run-to-completion semantics."""
+        model = event_data.model
+        fired = []
+        state_tree = self.build_state_tree(listify(getattr(model, self.model_attribute)),
+                                           self.state_cls.separator)
+        done = set()
+        with self():
+            event = self.events.get(EVENTLESS_TRIGGER)
+        if event is None:
+            return fired
+        ordered_paths = [list(path) for path in resolve_order(copy.deepcopy(state_tree))]
+        enabled = []
+        for state_path in ordered_paths:
+            state_name = self.state_cls.separator.join(state_path)
+            if state_name not in event.transitions:
+                continue
+            event_data.event = event
+            event_data.state = self.get_state(state_name)
+            event_data.source_name = state_name
+            event_data.source_path = copy.copy(state_path)
+            for trans in event.transitions[state_name]:
+                event_data.transition = trans
+                if await trans._eval_conditions(event_data):
+                    enabled.append((state_path, trans))
+                    break
+        for state_path, trans in enabled:
+            state_name = self.state_cls.separator.join(state_path)
+            handled = any(
+                self.state_cls.separator.join(state_path[:idx]) in done
+                for idx in range(1, len(state_path) + 1))
+            if handled:
+                continue
+            live_branch = state_tree
+            for elem in state_path:
+                if elem not in live_branch:
+                    live_branch = None
+                    break
+                live_branch = live_branch[elem]
+            if live_branch is None:
+                continue
+            event_data.event = event
+            event_data.state = self.get_state(state_name)
+            event_data.source_name = state_name
+            event_data.source_path = copy.copy(state_path)
+            event_data.transition = trans
+            event_data.result = await trans.execute(event_data)
+            fired.append(trans)
+            start_len, end_len = self._eventless_conflict_boundary(state_path)
+            for prefix_len in range(start_len, end_len + 1):
+                done.add(self.state_cls.separator.join(state_path[:prefix_len]))
+            state_tree = self.build_state_tree(
+                listify(getattr(model, self.model_attribute)),
+                self.state_cls.separator)
+        return fired
 
     async def _trigger_event_nested(self, event_data, _trigger, _state_tree):
         model = event_data.model

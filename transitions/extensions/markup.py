@@ -27,7 +27,7 @@ except ImportError:  # pragma: no cover
         """This is just an EnumMeta stub for Python 2 and Python 3.3 and before without Enum support."""
 
 from ..core import Machine
-from .nesting import HierarchicalMachine
+from .nesting import HierarchicalMachine, EVENTLESS_TRIGGER
 
 
 class MarkupMachine(Machine):
@@ -172,6 +172,8 @@ class MarkupMachine(Machine):
     def _convert_transitions(self, root):
         root['transitions'] = []
         for event in self.events.values():
+            if event.name == EVENTLESS_TRIGGER:
+                continue
             if self._omit_auto_transitions(event):
                 continue
 
