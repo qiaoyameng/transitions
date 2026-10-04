@@ -1657,6 +1657,55 @@ machine.final_Z()
 # >>> Machine is final!
 ```
 
+##### Eventless transitions and stabilization
+
+A `HierarchicalMachine` supports _eventless_ transitions which are declared by passing `None` as the trigger.
+Eventless transitions are not bound to the model and cannot be triggered from the outside.
+Instead, they are evaluated automatically after an external event has been processed and are executed until the machine reaches a _stable_ configuration, meaning a configuration in which no eventless transition is enabled anymore.
+This is useful when a single external event should be followed by several automatic steps before the machine waits for the next external input:
+
+```python
+from transitions.extensions import HierarchicalMachine
+
+states = ['idle', {'name': 'active', 'initial': 'booting',
+                   'children': ['booting', 'checking', 'waiting']}]
+transitions = [
+    ['start', 'idle', 'active'],
+    # eventless transitions are taken automatically once their source state is active
+    [None, 'active_booting', 'active_checking'],
+    [None, 'active_checking', 'active_waiting'],
+]
+
+machine = HierarchicalMachine(states=states, transitions=transitions, initial='idle')
+machine.start()  # enters 'active_booting' and stabilizes right away
+machine.state
+>>> 'active_waiting'
+```
+
+Stabilization happens in _microsteps_.
+In each microstep, a maximal set of non-conflicting eventless transitions is executed.
+Transitions of (more specific) substates take precedence over transitions of their parent states while transitions of different parallel regions do not conflict and can be executed in the same microstep.
+Every microstep executes callbacks in the same order: `before` callbacks, state `exit` callbacks, state `enter` callbacks and finally `after` callbacks.
+Eventless transitions can be guarded with `conditions` (and `unless`) just like ordinary transitions; a configuration where all remaining eventless transitions are blocked by unmet conditions is considered stable and not an error.
+When a machine is initialized with `queued=True`, newly arriving external events are deferred until a stable configuration has been reached.
+
+Since eventless transitions may form loops (e.g. `A -> B -> A -> ...`), stabilization is limited to `max_microsteps` (default: 100) microsteps per external event.
+When this limit is exceeded, a `StabilizationError` (a subclass of `MachineError`) is raised which reports the traversed microsteps -- the executed transitions and the resulting states -- instead of being silently treated like an unmet condition:
+
+```python
+from transitions.extensions.nesting import HierarchicalMachine, StabilizationError
+
+transitions = [['go', 'X', 'A'], [None, 'A', 'B'], [None, 'B', 'A']]
+machine = HierarchicalMachine(states=['X', 'A', 'B'], transitions=transitions,
+                              initial='X', max_microsteps=10)
+try:
+    machine.go()
+except StabilizationError as error:
+    print(error)
+    # >>> Stabilization did not reach a stable configuration within 10 microsteps.
+    # >>> Traversed microsteps: (A -> B) => ['B'], (B -> A) => ['A'], ...
+```
+
 ##### Reuse of previously created HSMs
 
 Besides semantic order, nested states are very handy if you want to specify state machines for specific tasks and plan to reuse them.

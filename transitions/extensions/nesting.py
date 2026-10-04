@@ -11,6 +11,7 @@ from collections import OrderedDict
 import copy
 from functools import partial, reduce
 import inspect
+from itertools import chain
 import logging
 
 try:
@@ -162,6 +163,11 @@ class NestedEventData(EventData):
         self.source_name = None
 
 
+class StabilizationError(MachineError):
+    """Raised when a machine does not reach a stable configuration within the configured
+        number of microsteps while processing eventless transitions."""
+
+
 class NestedState(State):
     """A state which allows substates.
     Attributes:
@@ -236,12 +242,13 @@ class NestedState(State):
 class NestedTransition(Transition):
     """A transition which handles entering and leaving nested states."""
 
-    def _resolve_transition(self, event_data):
+    def _resolve_transition(self, event_data, state_tree=None):
         dst_name_path = self.dest.split(event_data.machine.state_cls.separator)
         _ = event_data.machine.get_state(dst_name_path)
-        state_tree = event_data.machine.build_state_tree(
-            listify(getattr(event_data.model, event_data.machine.model_attribute)),
-            event_data.machine.state_cls.separator)
+        if state_tree is None:
+            state_tree = event_data.machine.build_state_tree(
+                listify(getattr(event_data.model, event_data.machine.model_attribute)),
+                event_data.machine.state_cls.separator)
 
         scope = event_data.machine.get_global_name(join=False)
         tmp_tree = state_tree.get(dst_name_path[0], None)
@@ -394,12 +401,18 @@ class HierarchicalMachine(Machine):
     transition_cls = NestedTransition
     event_cls = NestedEvent
 
+    eventless_event_name = '_eventless'
+    u""" Name of the internal event used to register eventless transitions. Eventless transitions
+        are declared by passing `trigger=None` to `add_transition` and are processed automatically
+        after an external event has been completed until a stable configuration is reached.
+    """
+
     def __init__(self, model=Machine.self_literal, states=None, initial='initial', transitions=None,
                  send_event=False, auto_transitions=True,
                  ordered_transitions=False, ignore_invalid_triggers=None,
                  before_state_change=None, after_state_change=None, name=None,
                  queued=False, prepare_event=None, finalize_event=None, model_attribute='state',
-                 model_override=False, on_exception=None, on_final=None, **kwargs):
+                 model_override=False, on_exception=None, on_final=None, max_microsteps=100, **kwargs):
         assert issubclass(self.state_cls, NestedState)
         assert issubclass(self.event_cls, NestedEvent)
         assert issubclass(self.transition_cls, NestedTransition)
@@ -407,6 +420,8 @@ class HierarchicalMachine(Machine):
         self.prefix_path = []
         self.scoped = self
         self._next_scope = None
+        self._stabilizing = False
+        self.max_microsteps = max_microsteps
         super(HierarchicalMachine, self).__init__(
             model=model, states=states, initial=initial, transitions=transitions,
             send_event=send_event, auto_transitions=auto_transitions,
@@ -537,6 +552,14 @@ class HierarchicalMachine(Machine):
 
     def add_transition(self, trigger, source, dest, conditions=None,
                        unless=None, before=None, after=None, prepare=None, **kwargs):
+        """Create a new nested transition and add it to the internal list.
+        Extends transitions.core.Machine.add_transition by eventless transitions: passing
+        `trigger=None` declares a transition which is not bound to an external event but is
+        executed automatically (in microsteps) after an external event has been processed,
+        until a stable configuration is reached.
+        """
+        if trigger is None:
+            trigger = self.eventless_event_name
         if source == self.wildcard_all and dest == self.wildcard_same:
             source = self.get_nested_state_names()
         else:
@@ -912,6 +935,10 @@ class HierarchicalMachine(Machine):
             with self():
                 res = self._trigger_event_nested(event_data, trigger, None)
             event_data.result = self._check_event_result(res, event_data.model, trigger)
+            if event_data.result:
+                # an external event has been completed; advance to a stable configuration
+                with self():
+                    self._stabilize(event_data.model)
         except BaseException as err:  # pylint: disable=broad-except; Exception will be handled elsewhere
             event_data.error = err
             if self.on_exception:
@@ -928,6 +955,219 @@ class HierarchicalMachine(Machine):
                               type(err).__name__,
                               str(err))
         return event_data.result
+
+    def _stabilize(self, model):
+        """Executes eventless transitions until a stable configuration is reached, meaning no
+        eventless transition is enabled anymore. Transitions are processed in microsteps; each
+        microstep executes a maximal set of non-conflicting transitions. New external events are
+        only processed after a stable configuration has been reached.
+        Args:
+            model (object): The model to stabilize.
+        Raises:
+            StabilizationError: When no stable configuration is reached within `max_microsteps`
+                                microsteps. The raised error reports the traversed states and
+                                transitions instead of being silently treated like an unmet
+                                condition.
+        """
+        if self._stabilizing:
+            # stabilization is already in progress further up the call stack; the ongoing
+            # stabilization loop re-evaluates the configuration and picks up enabled transitions
+            return
+        self._stabilizing = True
+        try:
+            event_data = NestedEventData(state=None, event=None, machine=self, model=model,
+                                         args=(), kwargs={})
+            event_data.result = None
+            trace = []
+            while True:
+                selected = self._select_eventless_transitions(event_data)
+                if not selected:
+                    break
+                if len(trace) >= self.max_microsteps:
+                    raise StabilizationError(
+                        "%sStabilization did not reach a stable configuration within %d microsteps. "
+                        "Traversed microsteps: %s. Current state(s): %s"
+                        % (self.name, self.max_microsteps,
+                           ", ".join("(%s) => %s" % (
+                               "; ".join("%s -> %s" % (self.state_cls.separator.join(source_path), dest)
+                                         for _, source_path, dest in step_trans),
+                               step_states) for step_trans, step_states in trace),
+                           getattr(model, self.model_attribute)))
+                self._execute_microstep(event_data, selected)
+                trace.append((selected, listify(getattr(model, self.model_attribute))))
+        finally:
+            self._stabilizing = False
+
+    def _eventless_transitions(self):
+        """Collects all eventless transitions registered in the machine and its nested scopes.
+        Returns:
+            dict: Maps global source state names to lists of (NestedEvent, NestedTransition, dest)
+            tuples where dest is the global destination name (or None for internal transitions).
+        """
+        collected = {}
+        with self():
+            self._collect_eventless(collected)
+        return collected
+
+    def _collect_eventless(self, collected):
+        event = self.events.get(self.eventless_event_name, None)
+        if event is not None:
+            for source, transitions in event.transitions.items():
+                global_source = self.state_cls.separator.join(self.prefix_path + [source])
+                for trans in transitions:
+                    collected.setdefault(global_source, []).append(
+                        (event, trans, self._global_dest(trans.dest)))
+        for state in self.states.values():
+            with self(state.name):
+                self._collect_eventless(collected)
+
+    def _global_dest(self, dest):
+        """Resolves the (potentially scope-local) destination of a transition to a global
+        state name based on the currently entered scope."""
+        if dest is None or not self.prefix_path:
+            return dest
+        dest_path = dest.split(self.state_cls.separator)
+        if dest_path[0] in self.states:
+            return self.state_cls.separator.join(self.prefix_path + dest_path)
+        return dest
+
+    def _select_eventless_transitions(self, event_data):
+        """Computes a maximal set of non-conflicting eventless transitions which can be executed
+        together in the next microstep. Transitions of (more specific) child states take
+        precedence over transitions of their parents. Transitions of different parallel regions
+        do not conflict with each other.
+        Args:
+            event_data (NestedEventData): Data related to the stabilization process.
+        Returns:
+            list of (NestedTransition, list, str) tuples of enabled transitions, their source
+            paths and their global destination names.
+        """
+        separator = self.state_cls.separator
+        state_tree = self.build_state_tree(
+            listify(getattr(event_data.model, self.model_attribute)), separator)
+        candidates = self._eventless_transitions()
+        claimed = []
+        selected = []
+        for state_path in resolve_order(state_tree):
+            state_name = separator.join(state_path)
+            if state_name not in candidates:
+                continue
+            for event, trans, dest in candidates[state_name]:
+                exit_scope = self._exit_scope(state_path, dest, state_tree)
+                if exit_scope is not None and any(self._scopes_conflict(exit_scope, other)
+                                                  for other in claimed):
+                    continue
+                event_data.event = event
+                event_data.state = self.get_state(state_name)
+                event_data.source_name = state_name
+                event_data.source_path = list(state_path)
+                event_data.transition = trans
+                self.callbacks(trans.prepare, event_data)
+                if trans._eval_conditions(event_data):
+                    selected.append((trans, list(state_path), dest))
+                    if exit_scope is not None:
+                        claimed.append(exit_scope)
+                    break
+        return selected
+
+    def _execute_microstep(self, event_data, selected):
+        """Executes one microstep consisting of all passed (non-conflicting) transitions.
+        For every microstep, callbacks are executed in the same order: transition `before`
+        callbacks, state exit callbacks, model update, state enter callbacks and finally
+        transition `after` callbacks.
+        Args:
+            event_data (NestedEventData): Data related to the stabilization process.
+            selected (list): (NestedTransition, source path, global dest) tuples to execute.
+        """
+        separator = self.state_cls.separator
+        state_tree = self.build_state_tree(
+            listify(getattr(event_data.model, self.model_attribute)), separator)
+        external = []
+        exit_partials = []
+        enter_partials = []
+        for trans, source_path, dest in selected:
+            event_data.source_name = separator.join(source_path)
+            event_data.source_path = list(source_path)
+            event_data.state = self.get_state(event_data.source_name)
+            event_data.transition = trans
+            if dest is None:  # internal transitions do not change the state configuration
+                continue
+            # resolve transitions with their global destination name from the root scope
+            local_dest, trans.dest = trans.dest, dest
+            try:
+                state_tree, exits, enters = trans._resolve_transition(event_data, state_tree=state_tree)
+            finally:
+                trans.dest = local_dest
+            external.append(trans)
+            exit_partials.extend(exits)
+            enter_partials.extend(enters)
+        for trans, source_path, _ in selected:
+            event_data.transition = trans
+            event_data.source_name = separator.join(source_path)
+            self.callbacks(chain(self.before_state_change, trans.before), event_data)
+        for func in exit_partials:
+            func()
+        if external:
+            self.transition_cls._update_model(event_data, state_tree)
+        for func in enter_partials:
+            func()
+        for trans, _, _ in selected:
+            event_data.transition = trans
+            self.callbacks(chain(trans.after, self.after_state_change), event_data)
+        if external:
+            with self():
+                on_final_cbs, _ = external[0]._final_check(event_data, state_tree, enter_partials)
+                for on_final_cb in on_final_cbs:
+                    on_final_cb()
+
+    def _exit_scope(self, source_path, dest, state_tree):
+        """Determines which part of the state tree is exited by a transition. Two transitions
+        conflict (and thus cannot be executed in the same microstep) when their exit scopes
+        overlap.
+        Args:
+            source_path (list): Path of the transition's source state.
+            dest (str or None): Global name of the transition's destination or None for
+                                internal transitions.
+            state_tree (dict): The currently active state tree.
+        Returns:
+            tuple or None: Path prefix of the exited branch or None when no state is exited.
+        """
+        if dest is None:  # internal transitions do not exit any state
+            return None
+        dest_path = dest.split(self.state_cls.separator)
+        common = 0
+        for src_elem, dst_elem in zip(source_path, dest_path):
+            if src_elem != dst_elem:
+                break
+            common += 1
+        if common < len(source_path):
+            return tuple(source_path[:common + 1])
+        # the destination is the source itself or one of its descendants;
+        # find the longest destination prefix that is currently active
+        root = []
+        branch = state_tree
+        for elem in dest_path:
+            if elem not in branch:
+                break
+            root.append(elem)
+            branch = branch[elem]
+        remaining = dest_path[len(root):]
+        if not remaining:
+            # the destination is already active (e.g. reflexive transitions);
+            # the transition is executed from the parent's scope
+            if not root:
+                return None
+            remaining = [root.pop()]
+            branch = reduce(dict.get, root, state_tree) if root else state_tree
+        if len(branch) > 1:
+            # in parallel states only the targeted sibling branch is exited
+            return tuple(root + [remaining[0]])
+        return tuple(root)
+
+    @staticmethod
+    def _scopes_conflict(scope_a, scope_b):
+        """Two exit scopes conflict when one of them contains the other."""
+        return scope_a[:len(scope_b)] == scope_b or scope_b[:len(scope_a)] == scope_a
 
     def _add_model_to_state(self, state, model):
         name = self.get_global_name(state)
@@ -1038,6 +1278,9 @@ class HierarchicalMachine(Machine):
             self._init_state(new_state)
 
     def _add_trigger_to_model(self, trigger, model):
+        if trigger == self.eventless_event_name:
+            # eventless transitions are processed automatically and not bound to models
+            return
         trig_func = partial(self.trigger_event, model, trigger)
         self._add_may_transition_func_for_trigger(trigger, model)
         # FunctionWrappers are only necessary if a custom separator is used
