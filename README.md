@@ -2225,6 +2225,30 @@ assert m.is_C()   # now timeout should have been processed
 
 You should consider passing `queued=True` to the `TimeoutMachine` constructor. This will make sure that events are processed sequentially and avoid asynchronous [racing conditions](https://github.com/pytransitions/transitions/issues/459) that may appear when timeout and event happen in proximity.
 
+##### State activities
+
+Sometimes a state should do work for as long as it is active -- for example continuously reading heartbeats while a device is `connected`. The `AsyncActivity` state feature runs a coroutine when the state is entered and cancels it (waiting for its cleanup) when the state is exited. An activity is bound to a particular entry of a state of a particular model: internal transitions do not restart it, and a late completion of an old entry cannot affect a state that has been entered again. The coroutine receives the current `AsyncEventData` and an `AsyncActivityHandle` whose `asyncio.Event` barriers (`started`, `cancelling`, `failed`) control its lifecycle. A coroutine that finishes on its own triggers the callbacks given in `on_activity_done`; one that raises an exception triggers `on_activity_error` (and falls back to the machine's `on_exception` handling).
+
+```python
+import asyncio
+from transitions.extensions.states import add_state_features
+from transitions.extensions.asyncio import AsyncActivity, HierarchicalAsyncMachine
+
+async def read_heartbeats(event_data, handle):
+    while not handle.cancelling.is_set():
+        # ...read a heartbeat, or cooperatively stop when the state is exited...
+        await asyncio.sleep(0.1)
+
+@add_state_features(AsyncActivity)
+class DeviceMachine(HierarchicalAsyncMachine):
+    pass
+
+states = ['disconnected', {'name': 'connected', 'activity': read_heartbeats}]
+m = DeviceMachine(states=states, initial='disconnected', send_event=True)
+asyncio.run(m.connect())   # activity is started
+asyncio.run(m.disconnect())  # activity is cancelled and awaited before the exit callbacks
+```
+
 #### <a name="django-support"></a> Using transitions together with Django
 
 You can have a look at the [FAQ](examples/Frequently%20asked%20questions.ipynb) for some inspiration or checkout `django-transitions`.

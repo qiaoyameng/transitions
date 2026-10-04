@@ -7,7 +7,7 @@ from transitions.extensions.states import add_state_features
 try:
     import asyncio
     from transitions.extensions.asyncio import AsyncMachine, HierarchicalAsyncMachine, AsyncEventData, \
-        AsyncTransition, AsyncTimeout
+        AsyncTransition, AsyncTimeout, AsyncActivity, AsyncActivityHandle
 
 except (ImportError, SyntaxError):
     asyncio = None  # type: ignore
@@ -721,6 +721,257 @@ class TestAsync(TestTransitions):
 
         asyncio.run(run())
 
+    @staticmethod
+    def _activity_machine(machine_cls, activity):
+        @add_state_features(AsyncActivity)
+        class ActivityMachine(machine_cls):  # type: ignore
+            pass
+
+        states = ['A', {'name': 'B', 'activity': activity}]
+        transitions = [['go', 'A', 'B'], ['back', 'B', 'A']]
+        return ActivityMachine(states=states, transitions=transitions, initial='A', send_event=True)
+
+    def test_activity_started_and_cancelled(self):
+        events = []
+
+        async def heartbeat(event_data, handle):
+            self.assertIsInstance(handle, AsyncActivityHandle)
+            events.append("started")
+            try:
+                while not handle.cancelling.is_set():
+                    try:
+                        await asyncio.wait_for(handle.cancelling.wait(), timeout=0.01)
+                    except asyncio.TimeoutError:
+                        continue
+                    except asyncio.CancelledError:
+                        await asyncio.sleep(0)
+            finally:
+                events.append("cleanup")
+
+        machine = self._activity_machine(self.machine_cls, heartbeat)
+
+        async def run():
+            await machine.go()
+            await asyncio.sleep(0)
+            self.assertEqual(1, len(machine.activity_tasks))
+            self.assertIn("started", events)
+            await machine.back()
+            self.assertEqual(["started", "cleanup"], events)
+            self.assertEqual(0, len(machine.activity_tasks))
+
+        asyncio.run(run())
+
+    def test_activity_internal_transition_not_restarted(self):
+        starts = []
+
+        async def heartbeat(event_data, handle):
+            starts.append(handle.generation)
+            await handle.cancelling.wait()
+
+        machine = self._activity_machine(self.machine_cls, heartbeat)
+        machine.add_transition('ping', 'B', None)
+
+        async def run():
+            await machine.go()
+            await asyncio.sleep(0)
+            generation = starts[0]
+            await machine.ping()
+            await machine.ping()
+            self.assertEqual([generation], starts)
+            await machine.back()
+            self.assertEqual(0, len(machine.activity_tasks))
+
+        asyncio.run(run())
+
+    def test_activity_rapid_leave_and_enter(self):
+        started = []
+
+        async def heartbeat(event_data, handle):
+            started.append(handle.generation)
+            await asyncio.sleep(0.05)
+
+        machine = self._activity_machine(self.machine_cls, heartbeat)
+
+        async def run():
+            await machine.go()
+            await asyncio.sleep(0)
+            first = started[-1]
+            await machine.back()
+            await machine.go()
+            await asyncio.sleep(0)
+            second = started[-1]
+            self.assertGreater(second, first)
+            await machine.back()
+            await asyncio.sleep(0.1)
+            self.assertEqual(0, len(machine.activity_tasks))
+
+        asyncio.run(run())
+
+    def test_activity_done_event(self):
+        done_event = asyncio.Event()
+
+        async def short_activity(event_data, handle):
+            await asyncio.sleep(0.01)
+
+        def mark_done(event_data):
+            self.assertEqual(event_data.state.name, 'B')
+            done_event.set()
+
+        @add_state_features(AsyncActivity)
+        class ActivityMachine(self.machine_cls):  # type: ignore
+            pass
+
+        states = ['A', {'name': 'B', 'activity': short_activity, 'on_activity_done': mark_done}]
+        machine = ActivityMachine(states=states,
+                                  transitions=[['go', 'A', 'B'], ['back', 'B', 'A']],
+                                  initial='A', send_event=True)
+
+        async def run():
+            await machine.go()
+            await asyncio.wait_for(done_event.wait(), timeout=1)
+            self.assertTrue(done_event.is_set())
+            handle = machine._activity_handles[id(machine)]['B']
+            await asyncio.wait_for(handle.task, timeout=1)
+            self.assertEqual(0, len(machine.activity_tasks))
+
+        asyncio.run(run())
+
+    def test_activity_error_event(self):
+        error_event = asyncio.Event()
+
+        async def faulty_activity(event_data, handle):
+            await handle.failed.wait()
+            raise handle.exception
+
+        def on_error(event_data):
+            self.assertIsInstance(event_data.error, ValueError)
+            error_event.set()
+
+        @add_state_features(AsyncActivity)
+        class ActivityMachine(self.machine_cls):  # type: ignore
+            pass
+
+        states = ['A', {'name': 'B', 'activity': faulty_activity, 'on_activity_error': on_error}, 'C']
+        machine = ActivityMachine(states=states,
+                                  transitions=[['go', 'A', 'B'], ['fail', 'B', 'C']],
+                                  initial='A', send_event=True)
+
+        async def run():
+            await machine.go()
+            handle = machine._activity_handles[id(machine)][machine.get_state('B').name]
+            handle.request_failure(ValueError("boom"))
+            await asyncio.wait_for(error_event.wait(), timeout=1)
+            self.assertTrue(error_event.is_set())
+            await asyncio.wait_for(handle.task, timeout=1)
+            self.assertEqual(0, len(machine.activity_tasks))
+
+        asyncio.run(run())
+
+    def test_activity_late_completion_ignored(self):
+        done_mock = MagicMock()
+
+        async def heartbeat(event_data, handle):
+            await asyncio.sleep(0.05)
+
+        @add_state_features(AsyncActivity)
+        class ActivityMachine(self.machine_cls):  # type: ignore
+            pass
+
+        states = ['A', {'name': 'B', 'activity': heartbeat, 'on_activity_done': done_mock}]
+        machine = ActivityMachine(states=states,
+                                  transitions=[['go', 'A', 'B'], ['back', 'B', 'A']],
+                                  initial='A', send_event=True)
+
+        async def run():
+            await machine.go()
+            await asyncio.sleep(0.01)
+            await machine.back()
+            await asyncio.sleep(0.1)
+            done_mock.assert_not_called()
+            self.assertEqual(0, len(machine.activity_tasks))
+
+        asyncio.run(run())
+
+    def test_activity_old_generation_completion_ignored_on_reentry(self):
+        done_mock = MagicMock()
+        releases = []
+
+        async def heartbeat(event_data, handle):
+            release = asyncio.Event()
+            releases.append((handle.generation, release))
+            await release.wait()
+
+        @add_state_features(AsyncActivity)
+        class ActivityMachine(self.machine_cls):  # type: ignore
+            pass
+
+        states = ['A', {'name': 'B', 'activity': heartbeat, 'on_activity_done': done_mock}]
+        machine = ActivityMachine(states=states,
+                                  transitions=[['go', 'A', 'B'], ['back', 'B', 'A']],
+                                  initial='A', send_event=True)
+
+        async def run():
+            await machine.go()
+            await asyncio.sleep(0)
+            old_generation, old_release = releases[-1]
+            await machine.back()
+            await machine.go()
+            await asyncio.sleep(0)
+            new_generation, new_release = releases[-1]
+            self.assertGreater(new_generation, old_generation)
+            old_release.set()
+            await asyncio.sleep(0.05)
+            done_mock.assert_not_called()
+            new_release.set()
+            await asyncio.sleep(0.05)
+            done_mock.assert_called_once()
+            await machine.back()
+            self.assertEqual(0, len(machine.activity_tasks))
+
+        asyncio.run(run())
+
+    def test_activity_remove_model(self):
+        model = DummyModel()
+
+        async def heartbeat(event_data, handle):
+            await handle.cancelling.wait()
+
+        @add_state_features(AsyncActivity)
+        class ActivityMachine(self.machine_cls):  # type: ignore
+            pass
+
+        states = ['A', {'name': 'B', 'activity': heartbeat}]
+        machine = ActivityMachine(model=model, states=states,
+                                  transitions=[['go', 'A', 'B']],
+                                  initial='A', send_event=True)
+
+        async def run():
+            await model.go()
+            await asyncio.sleep(0)
+            self.assertEqual(1, len(machine.activity_tasks))
+            machine.cancel_model_activities(model)
+            tasks = machine.pop_model_activities(model)
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.sleep(0)
+            machine.remove_model(model)
+            self.assertEqual(0, len(machine.activity_tasks))
+
+        asyncio.run(run())
+
+    def test_activity_tasks_empty_after_run(self):
+        async def heartbeat(event_data, handle):
+            await asyncio.sleep(0.01)
+
+        machine = self._activity_machine(self.machine_cls, heartbeat)
+
+        async def run():
+            await machine.go()
+            await machine.back()
+            await asyncio.sleep(0.05)
+            self.assertEqual(0, len(machine.activity_tasks))
+
+        asyncio.run(run())
+
     def test_deprecation_warnings(self):
         import warnings
 
@@ -791,6 +1042,85 @@ class TestHierarchicalAsync(TestAsync):
                           'P{0}3{0}y'.format(machine.state_cls.separator)], machine.state)
         asyncio.run(machine.to_B())
         self.assertTrue(machine.is_B())
+
+    def test_nested_activity_child_before_parent(self):
+        order = []
+
+        async def parent_activity(event_data, handle):
+            order.append("parent_start")
+            try:
+                await handle.cancelling.wait()
+            finally:
+                order.append("parent_cleanup")
+
+        async def child_activity(event_data, handle):
+            order.append("child_start")
+            while not handle.cancelling.is_set():
+                try:
+                    await asyncio.wait_for(handle.cancelling.wait(), timeout=0.01)
+                except asyncio.TimeoutError:
+                    continue
+                except asyncio.CancelledError:
+                    await asyncio.sleep(0)
+            order.append("child_cleanup")
+
+        @add_state_features(AsyncActivity)
+        class ActivityMachine(self.machine_cls):  # type: ignore
+            pass
+
+        states = ['A', {'name': 'B', 'activity': parent_activity,
+                        'initial': 'C', 'states': [
+                            {'name': 'C', 'activity': child_activity}, 'D']}]
+        machine = ActivityMachine(states=states,
+                                  transitions=[['go', 'A', 'B'], ['back', 'B', 'A']],
+                                  initial='A', send_event=True)
+
+        async def run():
+            await machine.go()
+            await asyncio.sleep(0)
+            self.assertEqual(["parent_start", "child_start"], order)
+            await machine.back()
+            self.assertEqual(["parent_start", "child_start", "child_cleanup", "parent_cleanup"], order)
+            self.assertEqual(0, len(machine.activity_tasks))
+
+        asyncio.run(run())
+
+    def test_parallel_activity_exit(self):
+        order = []
+
+        def make_activity(name):
+            async def activity(event_data, handle):
+                order.append(name + "_start")
+                while not handle.cancelling.is_set():
+                    try:
+                        await asyncio.wait_for(handle.cancelling.wait(), timeout=0.01)
+                    except asyncio.TimeoutError:
+                        continue
+                    except asyncio.CancelledError:
+                        await asyncio.sleep(0)
+                order.append(name + "_cleanup")
+            return activity
+
+        @add_state_features(AsyncActivity)
+        class ActivityMachine(self.machine_cls):  # type: ignore
+            pass
+
+        states = ['A', 'B', {'name': 'P', 'parallel': [
+            {'name': '1', 'children': [{'name': 'a', 'activity': make_activity('a')}], 'initial': 'a'},
+            {'name': '2', 'children': [{'name': 'b', 'activity': make_activity('b')}], 'initial': 'b'}]}]
+        machine = ActivityMachine(states=states, initial='A')
+
+        async def run():
+            await machine.to_P()
+            await asyncio.sleep(0)
+            self.assertIn('a_start', order)
+            self.assertIn('b_start', order)
+            await machine.to_B()
+            self.assertIn('a_cleanup', order)
+            self.assertIn('b_cleanup', order)
+            self.assertEqual(0, len(machine.activity_tasks))
+
+        asyncio.run(run())
 
     def test_final_state_nested(self):
         final_mock_B = MagicMock()

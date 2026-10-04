@@ -3,8 +3,8 @@ from ..core import Callback, Condition, Event, EventData, Machine, State, Transi
 from .nesting import HierarchicalMachine, NestedEvent, NestedState, NestedTransition, NestedEventData, \
     NestedStateConfig, NestedStateIdentifier
 from typing import Any, Awaitable, Optional, List, Type, Dict, Deque, Callable, Union, Iterable, DefaultDict, Literal, \
-    Sequence, Coroutine, Required, TypedDict, Collection
-from asyncio import Task
+    Sequence, Coroutine, Required, TypedDict, Collection, Set
+from asyncio import Task, Event
 from logging import Logger
 from enum import Enum
 from contextvars import ContextVar
@@ -119,6 +119,12 @@ class AsyncMachine(Machine):
     def get_state(self, state: Union[str, Enum]) -> AsyncState: ...
     async def process_context(self, func: Callable[[], Awaitable[None]], model: object) -> bool: ...
     def remove_model(self, model: object) -> None: ...
+    activity_tasks: Set[Task[Any]]
+    async def start_activity(self, state: AsyncState, event_data: AsyncEventData) -> AsyncActivityHandle: ...
+    async def stop_activity(self, state: AsyncState, event_data: AsyncEventData) -> None: ...
+    def cancel_model_activities(self, model: object) -> None: ...
+    def pop_model_activities(self, model: object) -> List[Task[Any]]: ...
+    async def await_model_activities(self, model: object) -> None: ...
     async def _process_async(self, trigger: Callable[[], Awaitable[None]], model: object) -> bool: ...
 
 
@@ -157,6 +163,35 @@ class AsyncTimeout(AsyncState):
     def on_timeout(self) -> CallbackList: ...
     @on_timeout.setter
     def on_timeout(self, value: AsyncCallbacksArg) -> None: ...
+
+class AsyncActivityHandle:
+    model: object
+    state_name: str
+    generation: int
+    task: Optional[Task[Any]]
+    started: Event
+    cancelling: Event
+    failed: Event
+    exception: Optional[BaseException]
+    def __init__(self, model: object, state_name: str, generation: int) -> None: ...
+    def request_failure(self, exception: BaseException) -> None: ...
+
+class AsyncActivity(AsyncState):
+    dynamic_methods: List[str]
+    activity: Optional[Callable[..., Any]]
+    _on_activity_done: List[Callback]
+    _on_activity_error: List[Callback]
+    def __init__(self, *args: Any, **kwargs: Any) -> None: ...
+    async def enter(self, event_data: AsyncEventData) -> None: ...  # type: ignore[override]
+    async def exit(self, event_data: AsyncEventData) -> None: ...  # type: ignore[override]
+    @property
+    def on_activity_done(self) -> CallbackList: ...
+    @on_activity_done.setter
+    def on_activity_done(self, value: AsyncCallbacksArg) -> None: ...
+    @property
+    def on_activity_error(self) -> CallbackList: ...
+    @on_activity_error.setter
+    def on_activity_error(self, value: AsyncCallbacksArg) -> None: ...
 
 class _DictionaryMock(Dict[Any, Any]):
     _value: Any

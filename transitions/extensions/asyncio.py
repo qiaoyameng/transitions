@@ -325,6 +325,9 @@ class AsyncMachine(Machine):
 
         self._transition_queue_dict = _DictionaryMock(self._transition_queue) if queued is True else {}
         self._queued = queued
+        self._activity_handles = {}
+        self._activity_generations = {}
+        self.activity_tasks = set()
         for model in listify(model):
             self.add_model(model)
 
@@ -445,6 +448,8 @@ class AsyncMachine(Machine):
         """Remove a model from the state machine. The model will still contain all previously added triggers
         and callbacks, but will not receive updates when states or transitions are added to the Machine.
         If an event queue is used, all queued events of that model will be removed."""
+        self.cancel_model_activities(model)
+        self.pop_model_activities(model)
         models = listify(model)
         if self.has_queue == 'model':
             for mod in models:
@@ -458,6 +463,145 @@ class AsyncMachine(Machine):
             new_queue = [queue.popleft()] + [e for e in queue if e.args[0].model not in models]
             self._transition_queue.clear()
             self._transition_queue.extend(new_queue)
+
+    async def start_activity(self, state, event_data):
+        """Starts the activity of ``state`` for the model embedded in ``event_data``.
+
+        Each invocation creates a new generation of the state's activity. The activity task only
+        proceeds after the state entry is complete (signalled by the handle's ``started`` barrier).
+        """
+        model = event_data.model
+        model_key = (id(model), state.name)
+        generation = self._activity_generations.get(model_key, 0) + 1
+        self._activity_generations[model_key] = generation
+        handle = AsyncActivityHandle(model, state.name, generation)
+        func = self.resolve_callable(state.activity, event_data)
+        handle.task = asyncio.create_task(self._run_activity(state, event_data, handle, func))
+        self.activity_tasks.add(handle.task)
+        handle.task.add_done_callback(self.activity_tasks.discard)
+        self._activity_handles.setdefault(id(model), {})[state.name] = handle
+        handle.started.set()
+        return handle
+
+    async def stop_activity(self, state, event_data):
+        """Cancels the activity of ``state`` for the event's model and awaits its cleanup.
+
+        Setting the ``cancelling`` barrier gives the activity coroutine a chance to perform
+        cooperative cleanup before the task is cancelled. Completion of a cancelled activity is
+        not converted into a machine event.
+        """
+        handle = self._activity_handles.get(id(event_data.model), {}).pop(state.name, None)
+        if handle is None:
+            return
+        task = handle.task
+        handle.started.set()
+        handle.cancelling.set()
+        if task is not None and not task.done():
+            if task is asyncio.current_task():
+                # The exit itself was triggered by the activity (e.g. through an on_activity_done
+                # callback). The cooperative barrier is already set; do not cancel ourselves.
+                return
+            task.cancel(CANCELLED_MSG)
+            try:
+                await asyncio.shield(task)
+            except (asyncio.CancelledError, Exception):
+                # cleanup of activities may be cancelled or raise; either way the state exit proceeds
+                pass
+
+    def cancel_model_activities(self, model):
+        """Requests the cooperative cancellation of every activity of ``model``.
+
+        Unlike ``stop_activity`` this does not await the running tasks. It is used by the
+        synchronous ``remove_model`` where awaiting is not possible.
+        """
+        for handle in self._activity_handles.get(id(model), {}).values():
+            handle.started.set()
+            handle.cancelling.set()
+            task = handle.task
+            if task is not None and not task.done():
+                task.cancel(CANCELLED_MSG)
+
+    def pop_model_activities(self, model):
+        """Returns and unregisters the activity tasks currently assigned to ``model``."""
+        handles = self._activity_handles.pop(id(model), {})
+        return [handle.task for handle in handles.values()
+                if handle.task is not None and not handle.task.done()]
+
+    async def await_model_activities(self, model):
+        """Awaits the cleanup of all activities that have been started for ``model``."""
+        tasks = [handle.task for handle in self._activity_handles.get(id(model), {}).values()
+                 if handle.task is not None and not handle.task.done()]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _run_activity(self, state, event_data, handle, func):
+        """Wraps the activity coroutine and converts its outcome into machine events."""
+        token = AsyncMachine.current_context.set(None)
+        cancelled = False
+        try:
+            await handle.started.wait()
+            await func(event_data, handle)
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        except BaseException as err:  # pylint: disable=broad-except; Exception is handled below
+            await self._activity_outcome(state, handle, error=err)
+        else:
+            if not handle.cancelling.is_set():
+                await self._activity_outcome(state, handle)
+        finally:
+            if not cancelled:
+                self._retire_activity_handle(handle)
+            AsyncMachine.current_context.reset(token)
+
+    def _retire_activity_handle(self, handle):
+        """Removes ``handle`` from the registry unless a newer generation has already replaced it."""
+        current = self._activity_handles.get(id(handle.model), {}).get(handle.state_name)
+        if current is handle:
+            del self._activity_handles[id(handle.model)][handle.state_name]
+
+    async def _activity_outcome(self, state, handle, error=None):
+        """Converts a finished activity into a machine event.
+
+        Notifications belonging to an outdated generation (a late completion of a state that has
+        since been entered again) or delivered while the state is being exited are ignored.
+        """
+        current = self._activity_handles.get(id(handle.model), {}).get(handle.state_name)
+        if current is not handle or handle.cancelling.is_set():
+            return
+        event_data = self._build_activity_event_data(state, handle)
+        callbacks = state.on_activity_error if error is not None else state.on_activity_done
+        if error is not None:
+            event_data.error = error
+        if not callbacks:
+            if error is not None:
+                await self._handle_activity_error(state, handle, error)
+            return
+        try:
+            await self.callbacks(callbacks, event_data)
+        except BaseException as callback_error:  # pylint: disable=broad-except
+            if error is None:
+                error = callback_error
+        if error is not None:
+            await self._handle_activity_error(state, handle, error)
+
+    async def _handle_activity_error(self, state, handle, error):
+        """Delegates activity exceptions to ``on_exception`` or cancels running transitions."""
+        current = self._activity_handles.get(id(handle.model), {}).get(handle.state_name)
+        if current is not handle or handle.cancelling.is_set():
+            return
+        if self.on_exception:
+            event_data = self._build_activity_event_data(state, handle)
+            event_data.error = error
+            await self.callbacks(self.on_exception, event_data)
+        else:
+            _LOGGER.error("%sActivity of state %s raised %s. Cancel running transitions...",
+                          self.name, handle.state_name, repr(error))
+            await self.cancel_running_transitions(handle.model)
+
+    def _build_activity_event_data(self, state, handle):
+        """Creates the ``AsyncEventData`` passed to activity outcome callbacks."""
+        return AsyncEventData(state, AsyncEvent(handle.state_name, self), self, handle.model, tuple(), {})
 
     async def _can_trigger(self, model, trigger, *args, **kwargs):
         state = self.get_model_state(model)
@@ -737,6 +881,105 @@ class AsyncTimeout(AsyncState):
         """Listifies passed values and assigns them to on_timeout."""
         self._on_timeout = listify(value)
 
+
+class AsyncActivityHandle(object):
+    """Tracks a single state activity execution.
+
+    An activity belongs to a specific entry of a state of a specific model. It is identified by an
+    increasing ``generation`` so that completion notifications of an outdated (already stopped or
+    replaced) activity cannot affect a state that has been entered again.
+
+    ``asyncio.Event`` barriers are used to control the life cycle of the wrapped coroutine:
+    ``started`` signals that the state has been fully entered, ``cancelling`` requests a cooperative
+    cancellation and ``failed`` allows the activity body to report an exception to the machine.
+
+    Attributes:
+        model (object): The model for which the activity was started.
+        state_name (str): The name of the state the activity belongs to.
+        generation (int): A monotonically increasing number identifying this particular entry.
+        task (asyncio.Task or None): The task running the activity coroutine.
+        started (asyncio.Event): Set by the machine once the state entry is complete.
+        cancelling (asyncio.Event): Set when the activity should stop cooperatively.
+        failed (asyncio.Event): Set to trigger an exception inside the activity body.
+        exception (BaseException or None): The exception to raise when ``failed`` is set.
+    """
+
+    def __init__(self, model, state_name, generation):
+        self.model = model
+        self.state_name = state_name
+        self.generation = generation
+        self.task = None
+        self.started = asyncio.Event()
+        self.cancelling = asyncio.Event()
+        self.failed = asyncio.Event()
+        self.exception = None
+
+    def request_failure(self, exception):
+        """Request the activity to raise ``exception`` by setting the ``failed`` barrier."""
+        self.exception = exception
+        self.failed.set()
+
+    def __repr__(self):
+        return "<AsyncActivityHandle(%s, %s#%s)>" % (type(self.model).__name__, self.state_name, self.generation)
+
+
+class AsyncActivity(AsyncState):
+    """State mixin that runs an asynchronous *activity* while the state is active.
+
+    The activity is a coroutine function started after the state's enter callbacks have been
+    processed and stopped (cancelled and awaited) before the exit callbacks are processed.
+    An activity is bound to one entry of a state of a particular model. Internal transitions
+    (transitions without a destination) do not exit and re-enter the state and therefore do
+    not restart the activity.
+
+    Attributes:
+        activity (callable or None): Coroutine function invoked with the current ``AsyncEventData``
+            and the corresponding ``AsyncActivityHandle``.
+        on_activity_done (list): Callbacks triggered when the activity finished on its own.
+        on_activity_error (list): Callbacks triggered when the activity raised an exception.
+    """
+
+    dynamic_methods = AsyncTimeout.dynamic_methods
+
+    def __init__(self, *args, **kwargs):
+        """
+        Args:
+            **kwargs: If kwargs contain 'activity', 'on_activity_done' or 'on_activity_error'
+                the values are assigned to the respective attributes.
+        """
+        self.activity = kwargs.pop("activity", None)
+        self.on_activity_done = kwargs.pop("on_activity_done", None)
+        self.on_activity_error = kwargs.pop("on_activity_error", None)
+        super().__init__(*args, **kwargs)
+
+    async def enter(self, event_data):
+        """Starts the state activity after the enter callbacks have been processed."""
+        await super().enter(event_data)
+        if self.activity is not None:
+            await event_data.machine.start_activity(self, event_data)
+
+    async def exit(self, event_data):
+        """Stops the state activity and awaits its cleanup before exit callbacks are processed."""
+        await event_data.machine.stop_activity(self, event_data)
+        await super().exit(event_data)
+
+    @property
+    def on_activity_done(self):
+        """Callbacks triggered when the activity finishes without being cancelled."""
+        return self._on_activity_done
+
+    @on_activity_done.setter
+    def on_activity_done(self, value):
+        self._on_activity_done = listify(value)
+
+    @property
+    def on_activity_error(self):
+        """Callbacks triggered when the activity raises an exception."""
+        return self._on_activity_error
+
+    @on_activity_error.setter
+    def on_activity_error(self, value):
+        self._on_activity_error = listify(value)
 
 class _DictionaryMock(dict):
 
