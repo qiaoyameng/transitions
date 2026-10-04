@@ -263,6 +263,166 @@ class TestParallel(TestNested):
         assert m.is_P_2(allow_substates=True)
         assert not m.is_A(allow_substates=True)
 
+    def test_sync_fork_and_join_callbacks(self):
+        sep = self.state_cls.separator
+        events = []
+
+        def record(name):
+            return lambda: events.append(name)
+
+        states = ['shipping',
+                  {'name': 'order',
+                   'parallel': [
+                       {'name': 'payment', 'children': ['pending', 'ready'], 'initial': 'pending'},
+                       {'name': 'stock', 'children': ['waiting', 'ready'], 'initial': 'waiting'}
+                   ]}]
+        model = type('OrderModel', (), {})()
+        machine = self.machine_cls(model=model, states=states, initial='order')
+        for state_name in machine.get_nested_state_names():
+            machine.on_enter(state_name, record('enter:%s' % state_name))
+            machine.on_exit(state_name, record('exit:%s' % state_name))
+        machine.add_transition('ship',
+                               ['order{0}payment{0}ready'.format(sep),
+                                'order{0}stock{0}ready'.format(sep)],
+                               'shipping')
+        machine.add_transition('start_shipping',
+                               'shipping',
+                               ['order{0}payment{0}pending'.format(sep),
+                                'order{0}stock{0}waiting'.format(sep)])
+
+        self.assertFalse(model.ship())
+        self.assertEqual(['order{0}payment{0}pending'.format(sep),
+                          'order{0}stock{0}waiting'.format(sep)], model.state)
+        self.assertFalse(events)
+
+        model.to_order_payment_ready()
+        self.assertFalse(model.ship())
+        self.assertEqual(['order{0}payment{0}ready'.format(sep),
+                          'order{0}stock{0}waiting'.format(sep)], model.state)
+
+        model.to_order_stock_ready()
+        self.assertTrue(model.ship())
+        self.assertEqual('shipping', model.state)
+        self.assertEqual([
+            'exit:order{0}payment{0}ready'.format(sep),
+            'exit:order{0}stock{0}ready'.format(sep),
+            'exit:order{0}payment'.format(sep),
+            'exit:order{0}stock'.format(sep),
+            'exit:order',
+            'enter:shipping'
+        ], events[-6:])
+
+        events = []
+        self.assertTrue(model.start_shipping())
+        self.assertEqual([
+            'exit:shipping',
+            'enter:order',
+            'enter:order{0}payment'.format(sep),
+            'enter:order{0}stock'.format(sep),
+            'enter:order{0}payment{0}pending'.format(sep),
+            'enter:order{0}stock{0}waiting'.format(sep)
+        ], events)
+
+    def test_sync_condition_evaluated_once(self):
+        sep = self.state_cls.separator
+        calls = []
+        states = ['done', {'name': 'work', 'parallel': ['a', 'b']}]
+        machine = self.machine_cls(states=states, initial='work')
+        machine.add_transition('finish',
+                               ['work{0}a'.format(sep), 'work{0}b'.format(sep)],
+                               'done',
+                               conditions=lambda: calls.append(1) or True)
+
+        self.assertTrue(machine.finish())
+        self.assertEqual(1, len(calls))
+
+    def test_sync_multiple_sources_and_destinations(self):
+        sep = self.state_cls.separator
+        states = [{'name': 'work',
+                   'parallel': [
+                       {'name': 'a', 'children': ['x', 'y'], 'initial': 'x'},
+                       {'name': 'b', 'children': ['x', 'y'], 'initial': 'x'}
+                   ]}]
+        machine = self.machine_cls(states=states, initial='work')
+        machine.add_transition('rewire',
+                               ['work{0}a{0}x'.format(sep), 'work{0}b{0}x'.format(sep)],
+                               ['work{0}a{0}y'.format(sep), 'work{0}b{0}y'.format(sep)])
+
+        self.assertTrue(machine.rewire())
+        self.assertEqual(['work{0}a{0}y'.format(sep), 'work{0}b{0}y'.format(sep)], machine.state)
+
+    def test_sync_transition_defined_in_nested_scope(self):
+        sep = self.state_cls.separator
+        states = ['idle',
+                  {'name': 'work',
+                   'parallel': [
+                       {'name': 'a',
+                        'children': ['wait', {'name': 'processing', 'parallel': ['x', 'y']}],
+                        'initial': 'wait',
+                        'transitions': [['start_processing',
+                                         'wait',
+                                         ['processing{0}x'.format(sep),
+                                          'processing{0}y'.format(sep)]]]},
+                       {'name': 'b', 'children': ['x', 'y'], 'initial': 'x'}
+                   ],
+                   }]
+        machine = self.machine_cls(states=states, initial='work')
+        self.assertTrue(machine.start_processing())
+        self.assertEqual([['work{0}a{0}processing{0}x'.format(sep),
+                           'work{0}a{0}processing{0}y'.format(sep)],
+                          'work{0}b{0}x'.format(sep)], machine.state)
+
+    def test_sync_invalid_configuration(self):
+        sep = self.state_cls.separator
+        states = ['done',
+                  {'name': 'work',
+                   'parallel': [
+                       {'name': 'a', 'children': ['x', 'y'], 'initial': 'x'},
+                       {'name': 'b', 'children': ['x', 'y'], 'initial': 'x'},
+                       {'name': 'c', 'children': ['x', 'y'], 'initial': 'x'}
+                   ]}]
+        machine = self.machine_cls(states=states, initial='work')
+
+        with self.assertRaises(ValueError):
+            machine.add_transition('invalid',
+                                   ['work{0}a{0}x'.format(sep), 'work{0}a{0}y'.format(sep)],
+                                   'done', sync=True)
+        with self.assertRaises(ValueError):
+            machine.add_transition('invalid',
+                                   ['work{0}a{0}x'.format(sep), 'work{0}b{0}x'.format(sep)],
+                                   ['done', 'work{0}a{0}y'.format(sep)])
+        with self.assertRaises(ValueError):
+            machine.add_transition('invalid',
+                                   'done',
+                                   ['work{0}a{0}x'.format(sep), 'work{0}a{0}y'.format(sep)])
+        with self.assertRaises(ValueError):
+            machine.add_transition('invalid',
+                                   'done',
+                                   ['work{0}a{0}x'.format(sep)], sync=True)
+
+    def test_sync_uses_model_specific_active_configuration(self):
+        sep = self.state_cls.separator
+        states = ['done',
+                  {'name': 'work',
+                   'parallel': [
+                       {'name': 'a', 'children': ['x', 'y'], 'initial': 'x'},
+                       {'name': 'b', 'children': ['x', 'y'], 'initial': 'x'}
+                   ]}]
+        first = type('FirstModel', (), {})()
+        second = type('SecondModel', (), {})()
+        machine = self.machine_cls(model=[first, second], states=states, initial='work')
+        machine.add_transition('finish',
+                               ['work{0}a{0}y'.format(sep), 'work{0}b{0}y'.format(sep)],
+                               'done')
+        first.to_work_a_y()
+        first.to_work_b_y()
+
+        self.assertTrue(first.finish())
+        self.assertEqual('done', first.state)
+        self.assertEqual(['work{0}a{0}x'.format(sep), 'work{0}b{0}x'.format(sep)], second.state)
+        self.assertFalse(second.finish())
+        self.assertEqual(['work{0}a{0}x'.format(sep), 'work{0}b{0}x'.format(sep)], second.state)
+
 
 @skipIf(pgv is None, "pygraphviz is not available")
 class TestParallelWithPyGraphviz(TestParallel):

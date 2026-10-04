@@ -123,31 +123,80 @@ class NestedEvent(Event):
         """
         machine = event_data.machine
         model = event_data.model
-        state_tree = machine.build_state_tree(getattr(model, machine.model_attribute), machine.state_cls.separator)
+        state_tree = machine.build_state_tree(getattr(model, machine.model_attribute),
+                                              machine.state_cls.separator)
         state_tree = reduce(dict.get, machine.get_global_name(join=False), state_tree)
         ordered_states = resolve_order(state_tree)
         done = set()
+        seen = set()
         event_data.event = self
+        sync_transitions = [trans for candidates in self.transitions.values()
+                            for trans in candidates if getattr(trans, 'sync', False)]
+        sync_candidates = []
+        for trans in sync_transitions:
+            if trans not in seen:
+                seen.add(trans)
+                sync_candidates.append(trans)
+        if sync_candidates:
+            ordered_list = list(ordered_states)
+            first_state = ordered_list[-1] if ordered_list else []
+            machine.callbacks(machine.prepare_event, event_data)
+            names = [machine.state_cls.separator.join(trans.sources_paths[0])
+                     for trans in sync_candidates]
+            event_data.sync_candidate_names = names
+            event_data.state = machine.get_state(first_state)
+            event_data.source_name = machine.state_cls.separator.join(first_state)
+            event_data.source_path = copy.copy(first_state)
+            event_data.sync_state_tree = state_tree
+            event_data.sync_candidate_transitions = sync_candidates
+            self._process(event_data)
+            if event_data.result:
+                return True
+            seen.update(sync_candidates)
+        event_data.sync_candidate_transitions = None
         for state_path in ordered_states:
             state_name = machine.state_cls.separator.join(state_path)
             if state_name not in done and state_name in self.transitions:
                 event_data.state = machine.get_state(state_name)
                 event_data.source_name = state_name
                 event_data.source_path = copy.copy(state_path)
+                event_data.sync_state_tree = state_tree
+                event_data.sync_candidate_names = [state_name]
+                event_data.sync_candidate_transitions = None
                 self._process(event_data)
-                if event_data.result:
-                    elems = state_path
+                if getattr(event_data.transition, 'sync', False):
+                    source_paths = event_data.transition.sources_paths
+                else:
+                    source_paths = [state_path]
+                for source_path in source_paths:
+                    elems = copy.copy(source_path)
                     while elems:
                         done.add(machine.state_cls.separator.join(elems))
                         elems.pop()
+                if event_data.result:
+                    return True
         return event_data.result
 
     def _process(self, event_data):
         machine = event_data.machine
-        machine.callbacks(event_data.machine.prepare_event, event_data)
-        _LOGGER.debug("%sExecuted machine preparation callbacks before conditions.", machine.name)
-        for trans in self.transitions[event_data.source_name]:
+        explicit_transitions = getattr(event_data, 'sync_candidate_transitions', None)
+        if explicit_transitions is None:
+            machine.callbacks(event_data.machine.prepare_event, event_data)
+            _LOGGER.debug("%sExecuted machine preparation callbacks before conditions.", machine.name)
+        if explicit_transitions is not None:
+            transitions = explicit_transitions
+            event_data.result = False
+        else:
+            candidate_names = getattr(event_data, 'sync_candidate_names', [event_data.source_name])
+            transitions = [trans for name in candidate_names
+                           for trans in self.transitions.get(name, [])]
+            transitions = [trans for index, trans in enumerate(transitions)
+                           if trans not in transitions[:index]]
+        for trans in transitions:
             event_data.transition = trans
+            if getattr(trans, 'sync', False) and \
+                    not trans.sources_active(event_data.sync_state_tree, machine):
+                continue
             event_data.result = trans.execute(event_data)
             if event_data.result:
                 break
@@ -236,6 +285,247 @@ class NestedState(State):
 class NestedTransition(Transition):
     """A transition which handles entering and leaving nested states."""
 
+    def __init__(self, *args, **kwargs):
+        sync = kwargs.pop('sync', False)
+        super(NestedTransition, self).__init__(*args, **kwargs)
+        self.sync = sync
+        self.sources_paths = []
+        self.dests_paths = []
+
+    def sources_active(self, state_tree, machine=None):
+        for source_path in self.sources_paths:
+            subtree = state_tree
+            active = False
+            for elem in source_path:
+                if elem not in subtree:
+                    active = False
+                    break
+                subtree = subtree[elem]
+                active = True
+            if not active:
+                return False
+            if subtree and (machine is None or not machine.get_state(source_path).states):
+                return False
+        return True
+
+    @staticmethod
+    def _is_parallel_state(state):
+        return isinstance(state.initial, list) and len(state.initial) > 1
+
+    def _is_parallel_path(self, machine, path):
+        if not path:
+            return False
+        return NestedTransition._is_parallel_state(machine.get_state(path))
+
+    @staticmethod
+    def _common_prefix(paths):
+        prefix = []
+        for values in zip(*paths):
+            if len(set(values)) > 1:
+                break
+            prefix.append(values[0])
+        return prefix
+
+    def _sync_exit_roots(self, machine, target_leaves):
+        roots = []
+        explicit_dests = {tuple(path) for path in self.dests_paths}
+        for source_path in self.sources_paths:
+            root = copy.copy(source_path)
+            while root:
+                prefix = self._common_prefix([root] + target_leaves)
+                root_tuple = tuple(root)
+                if tuple(prefix) == root_tuple or root_tuple in explicit_dests:
+                    break
+                parallel_path = root[:-1]
+                if self._is_parallel_path(machine, parallel_path):
+                    parallel_state = machine.get_state(parallel_path)
+                    child_names = [child.name for child in parallel_state.states.values()]
+                    source_children = {path[len(parallel_path)] for path in self.sources_paths
+                                      if path[:len(parallel_path)] == parallel_path
+                                      and len(path) > len(parallel_path)}
+                    target_in_parallel = any(path[:len(parallel_path)] == parallel_path
+                                             for path in target_leaves)
+                    if set(source_children) == set(child_names) and not target_in_parallel:
+                        root = copy.copy(parallel_path)
+                        continue
+                    break
+                if len(root) == 1:
+                    break
+                root = parallel_path
+            roots.append(tuple(root))
+        minimal_roots = []
+        for root in sorted(roots, key=len):
+            if not any(root != other and other[:len(root)] == root for other in roots):
+                minimal_roots.append(root)
+        return minimal_roots
+
+    @staticmethod
+    def _copy_active_branch(destination, source, path):
+        for elem in path:
+            if elem not in destination:
+                destination[elem] = OrderedDict()
+            destination = destination[elem]
+            source = source[elem]
+
+    @staticmethod
+    def _merge_target_tree(target, source):
+        for key, value in source.items():
+            if key in target and value:
+                NestedTransition._merge_target_tree(target[key], value)
+            else:
+                target[key] = value
+
+    @staticmethod
+    def _path_exists(tree, path):
+        subtree = tree
+        for elem in path:
+            if elem not in subtree:
+                return False
+            subtree = subtree[elem]
+        return True
+
+    def _sync_target_tree(self, event_data):
+        target_tree = OrderedDict()
+        for dest_path in self.dests_paths:
+            new_states, _ = self._enter_nested([], copy.copy(dest_path), [], event_data)
+            self._merge_target_tree(target_tree, new_states)
+
+        queue = [([], target_tree)]
+        while queue:
+            path, subtree = queue.pop(0)
+            if path and self._is_parallel_path(event_data.machine, path):
+                state = event_data.machine.get_state(path)
+                children = [child.name for child in state.states.values()]
+                ordered = OrderedDict((name, subtree[name]) for name in children if name in subtree)
+                subtree.clear()
+                subtree.update(ordered)
+            for name, child in subtree.items():
+                if child:
+                    queue.append((path + [name], child))
+        return target_tree
+
+    def _normalize_parallel_tree(self, machine, tree):
+        queue = [([], tree)]
+        while queue:
+            path, subtree = queue.pop(0)
+            with machine():
+                is_parallel = self._is_parallel_path(machine, path)
+            if is_parallel:
+                with machine():
+                    state = machine.get_state(path)
+                children = [child.name for child in state.states.values()]
+                ordered = OrderedDict((name, subtree[name]) for name in children if name in subtree)
+                subtree.clear()
+                subtree.update(ordered)
+            for name, child in subtree.items():
+                if child:
+                    queue.append((path + [name], child))
+
+    def _merge_sync_targets(self, machine, state_tree, target_tree, event_data):
+        previous_tree = copy.deepcopy(state_tree)
+        queue = [([], target_tree)]
+        while queue:
+            path, target_subtree = queue.pop(0)
+            active_subtree = reduce(dict.get, path, state_tree)
+            for name, new_subtree in target_subtree.items():
+                target_path = path + [name]
+                if name not in active_subtree:
+                    active_subtree[name] = new_subtree
+                elif new_subtree:
+                    queue.append((target_path, new_subtree))
+
+        scope = event_data.machine.get_global_name(join=False)
+        enter_paths = set()
+        for local_dest_path in self.dests_paths:
+            dest_path = scope + local_dest_path
+            for index in range(1, len(dest_path) + 1):
+                path = tuple(dest_path[:index])
+                if not self._path_exists(previous_tree, list(path)):
+                    enter_paths.add(path)
+
+        ordered_enter_paths = []
+        queue = [([], target_tree)]
+        while queue:
+            next_queue = []
+            for path, target_subtree in queue:
+                for name, new_subtree in target_subtree.items():
+                    target_path = path + [name]
+                    if tuple(target_path) in enter_paths:
+                        ordered_enter_paths.append(target_path)
+                    if new_subtree:
+                        next_queue.append((target_path, new_subtree))
+            queue = next_queue
+        enter_partials = []
+        for path in ordered_enter_paths:
+            with machine():
+                state = machine.get_state(path)
+                enter_partials.append(partial(state.scoped_enter, event_data, path[:-1]))
+        return enter_partials
+
+    def _resolve_sync_transition(self, event_data):
+        machine = event_data.machine
+        scope = machine.get_global_name(join=False)
+        model_states = listify(getattr(event_data.model, machine.model_attribute))
+        state_tree = machine.build_state_tree(model_states, machine.state_cls.separator)
+
+        target_tree = self._sync_target_tree(event_data)
+        global_target_leaves = [scope + path
+                                 for path in resolve_order(copy.deepcopy(target_tree))]
+        original_paths = (self.sources_paths, self.dests_paths)
+        self.sources_paths = [scope + path for path in self.sources_paths]
+        self.dests_paths = global_target_leaves
+        try:
+            exit_roots = self._sync_exit_roots(machine, global_target_leaves)
+        finally:
+            self.sources_paths, self.dests_paths = original_paths
+
+        exit_trees = OrderedDict()
+        for root in exit_roots:
+            parent = list(root[:-1])
+            exit_tree = exit_trees.setdefault(tuple(parent), OrderedDict())
+            active_subtree = state_tree
+            target_subtree = exit_tree
+            for elem in parent:
+                active_subtree = active_subtree[elem]
+                if elem not in target_subtree:
+                    target_subtree[elem] = OrderedDict()
+                target_subtree = target_subtree[elem]
+            self._copy_active_branch(target_subtree, active_subtree, [root[-1]])
+            active_root_subtree = reduce(dict.get, root, state_tree)
+            copied_root_subtree = reduce(dict.get, root, exit_tree)
+            if active_root_subtree:
+                copied_root_subtree.clear()
+                self._merge_target_tree(copied_root_subtree, copy.deepcopy(active_root_subtree))
+
+        exit_partials = []
+        for _, exit_tree in exit_trees.items():
+            for state_path in resolve_order(exit_tree):
+                with machine():
+                    state = machine.get_state(state_path)
+                exit_partials.append(partial(state.scoped_exit, event_data, state_path[:-1]))
+
+        for root in exit_roots:
+            subtree = state_tree
+            try:
+                for elem in root[:-1]:
+                    subtree = subtree[elem]
+                del subtree[root[-1]]
+            except KeyError:
+                continue
+
+        merge_tree = target_tree
+        if scope:
+            merge_tree = OrderedDict()
+            subtree = merge_tree
+            for elem in scope[:-1]:
+                subtree[elem] = OrderedDict()
+                subtree = subtree[elem]
+            subtree[scope[-1]] = target_tree
+        self._normalize_parallel_tree(machine, merge_tree)
+        enter_partials = self._merge_sync_targets(machine, state_tree, merge_tree, event_data)
+        self._normalize_parallel_tree(machine, state_tree)
+        return state_tree, exit_partials, enter_partials
+
     def _resolve_transition(self, event_data):
         dst_name_path = self.dest.split(event_data.machine.state_cls.separator)
         _ = event_data.machine.get_state(dst_name_path)
@@ -281,6 +571,18 @@ class NestedTransition(Transition):
         return state_tree, exit_partials, enter_partials
 
     def _change_state(self, event_data):
+        if self.sync:
+            state_tree, exit_partials, enter_partials = self._resolve_sync_transition(event_data)
+            for func in exit_partials:
+                func()
+            self._update_model(event_data, state_tree)
+            for func in enter_partials:
+                func()
+            with event_data.machine():
+                on_final_cbs, _ = self._final_check(event_data, state_tree, enter_partials)
+                for on_final_cb in on_final_cbs:
+                    on_final_cb()
+            return
         state_tree, exit_partials, enter_partials = self._resolve_transition(event_data)
         for func in exit_partials:
             func()
@@ -537,16 +839,183 @@ class HierarchicalMachine(Machine):
 
     def add_transition(self, trigger, source, dest, conditions=None,
                        unless=None, before=None, after=None, prepare=None, **kwargs):
+        sync = kwargs.pop('sync', False)
         if source == self.wildcard_all and dest == self.wildcard_same:
             source = self.get_nested_state_names()
         else:
             if source != self.wildcard_all:
-                source = [self.state_cls.separator.join(self._get_enum_path(s)) if isinstance(s, Enum) else s
-                          for s in listify(source)]
-            if dest != self.wildcard_same:
-                dest = self.state_cls.separator.join(self._get_enum_path(dest)) if isinstance(dest, Enum) else dest
+                source = [self.state_cls.separator.join(self._get_enum_path(s))
+                          if isinstance(s, Enum) else s for s in listify(source)]
+            if dest != self.wildcard_same and dest is not None:
+                dest = [self.state_cls.separator.join(self._get_enum_path(d))
+                        if isinstance(d, Enum) else d for d in listify(dest)]
+
+        source_values = [] if source == self.wildcard_all else listify(source)
+        dest_values = [] if dest is None or dest in (self.wildcard_all, self.wildcard_same) \
+            else listify(dest)
+        source_paths = [self._try_sync_state_path(s) for s in source_values]
+        dest_paths = [self._try_sync_state_path(d) for d in dest_values]
+        resolvable = all(path is not None for path in source_paths + dest_paths)
+        is_sync = resolvable and (
+            sync or (len(source_paths) > 1 and self._paths_orthogonal(source_paths)) \
+            or len(dest_paths) > 1
+        )
+
+        if not resolvable and not sync:
+            if len(dest_paths) == 1:
+                dest = self.state_cls.separator.join(dest_values[0].split(self.state_cls.separator))
+            elif dest is not None and dest not in (self.wildcard_all, self.wildcard_same):
+                dest = dest_values[0]
+            super(HierarchicalMachine, self).add_transition(
+                trigger, source, dest, conditions, unless, before, after, prepare, **kwargs)
+            return
+        if not resolvable:
+            raise ValueError("Synchronized transitions require registered source and destination states.")
+
+        if is_sync:
+            self._validate_sync_transition(trigger, source_paths, dest_paths)
+            if trigger == self.model_attribute:
+                raise ValueError("Trigger name cannot be same as model attribute name.")
+            if trigger not in self.events:
+                self.events[trigger] = self._create_event(trigger, self)
+                for model in self.models:
+                    self._add_trigger_to_model(trigger, model)
+            source_names = [self.state_cls.separator.join(path) for path in source_paths]
+            dest_names = [self.state_cls.separator.join(path) for path in dest_paths]
+            transition = self._create_transition(source_names[0],
+                                                 dest_names[0] if dest_names else None,
+                                                 conditions, unless, before, after, prepare,
+                                                 sync=True, **kwargs)
+            transition.sources_paths = source_paths
+            transition.dests_paths = dest_paths
+            self.events[trigger].add_transition(transition)
+            return
+
+        if len(dest_paths) == 1:
+            dest = self.state_cls.separator.join(dest_paths[0])
+        elif dest not in (None, self.wildcard_all, self.wildcard_same):
+            dest = None
         super(HierarchicalMachine, self).add_transition(trigger, source, dest, conditions,
                                                         unless, before, after, prepare, **kwargs)
+
+    def _sync_state_path(self, state):
+        scope = self.prefix_path
+        if isinstance(state, Enum):
+            with self():
+                path = self._get_enum_path(state)
+            return path
+        elif hasattr(state, 'name'):
+            with self():
+                path = self._get_state_path(state)
+            if not path:
+                raise ValueError("State '%s' is not a registered state." % state.name)
+            return path
+        else:
+            local_path = state.split(self.state_cls.separator)
+            try:
+                self.get_state(scope + local_path)
+                return local_path
+            except ValueError:
+                self.get_state(local_path)
+                return local_path
+
+    def _try_sync_state_path(self, state):
+        if not isinstance(state, string_types) and not isinstance(state, Enum) \
+                and hasattr(state, 'name'):
+            return self._sync_state_path(state)
+        try:
+            return self._sync_state_path(state)
+        except ValueError:
+            return None
+
+    def _is_parallel_path(self, path):
+        return NestedTransition._is_parallel_state(self.get_state(path)) if path else False
+
+    @staticmethod
+    def _prefix_path(path, prefix):
+        return path[:len(prefix)] == prefix
+
+    def _paths_orthogonal(self, paths):
+        for index, first in enumerate(paths):
+            for second in paths[index + 1:]:
+                prefix_length = 0
+                for first_elem, second_elem in zip(first, second):
+                    if first_elem != second_elem:
+                        break
+                    prefix_length += 1
+                prefix = first[:prefix_length]
+                if not prefix:
+                    if not NestedTransition._is_parallel_state(self.scoped):
+                        return False
+                elif not self._is_parallel_path(prefix):
+                    return False
+        return True
+
+    def _state_leaf_paths(self, path, state=None):
+        state = state or self.get_state(path)
+        if not state.states:
+            return [list(path)]
+        initial_states = [state.states[name] for name in listify(state.initial)]
+        leaves = []
+        for initial_state in initial_states:
+            child_name = initial_state.name
+            leaves.extend(self._state_leaf_paths(path + [child_name], initial_state))
+        return leaves
+
+    def _validate_sync_transition(self, trigger, source_paths, dest_paths):
+        if not source_paths or trigger in (self.wildcard_all, self.wildcard_same):
+            raise ValueError("Synchronized transitions require explicit source states.")
+        if not dest_paths:
+            raise ValueError("Synchronized transitions require explicit destination states.")
+        if len(source_paths) > 1 and any(self.get_state(path).states for path in source_paths):
+            raise ValueError("Synchronized source states must be active leaf states.")
+        if len(source_paths) == 1 and self.get_state(source_paths[0]).states and not all(
+                dest_path[:len(source_paths[0])] == source_paths[0] for dest_path in dest_paths):
+            raise ValueError("A synchronized fork must enter regions below the source state.")
+        if len(source_paths) > 1 and not self._paths_orthogonal(source_paths):
+            raise ValueError("Synchronized source states must be orthogonal.")
+
+        target_leaves = []
+        for path in dest_paths:
+            target_leaves.extend(self._state_leaf_paths(path))
+        if len(dest_paths) > 1 and not self._paths_orthogonal(dest_paths):
+            raise ValueError("Synchronized destination states must be orthogonal.")
+        if len(target_leaves) > 1 and not self._paths_orthogonal(target_leaves):
+            raise ValueError("Synchronized destination states must enter orthogonal regions.")
+
+        candidates = set()
+        for path in source_paths + dest_paths:
+            candidates.update(tuple(path[:index]) for index in range(1, len(path) + 1))
+
+        for candidate in candidates:
+            if not self._is_parallel_path(list(candidate)):
+                continue
+            parallel_state = self.get_state(list(candidate))
+            child_names = [child.name for child in parallel_state.states.values()]
+            source_children = {
+                path[len(candidate)] for path in source_paths
+                if self._prefix_path(path, list(candidate)) and len(path) > len(candidate)}
+            dest_children = {
+                path[len(candidate)] for path in dest_paths
+                if self._prefix_path(path, list(candidate)) and len(path) > len(candidate)}
+            exact_dest = any(tuple(path) == candidate for path in dest_paths)
+
+            if exact_dest:
+                if source_children and source_children != set(child_names):
+                    raise ValueError(
+                        "Synchronized transition does not exit every region of a parallel state.")
+            elif dest_children:
+                if not source_children:
+                    if dest_children != set(child_names):
+                        raise ValueError(
+                            "Entering a parallel state requires every orthogonal region.")
+                elif not (len(source_children) == 1 and source_children == dest_children) and \
+                        source_children != dest_children:
+                    raise ValueError(
+                        "Synchronized regions must map to a valid parallel configuration.")
+            elif source_children and source_children != set(child_names):
+                raise ValueError(
+                    "Synchronized transition leaves a parallel configuration incomplete.")
 
     def get_global_name(self, state=None, join=True):
         """Returns the name of the passed state in context of the current prefix/scope.
@@ -761,6 +1230,21 @@ class HierarchicalMachine(Machine):
 
     def _can_trigger(self, model, trigger, *args, **kwargs):
         state_tree = self.build_state_tree(getattr(model, self.model_attribute), self.state_cls.separator)
+        with self():
+            if trigger in self.events:
+                for transitions in self.events[trigger].transitions.values():
+                    for transition in transitions:
+                        if not getattr(transition, 'sync', False):
+                            continue
+                        if not transition.sources_active(state_tree, self):
+                            continue
+                        event = Event(name=trigger, machine=self)
+                        event_data = EventData(self.get_model_state(model), event, self, model, args, kwargs)
+                        event_data.transition = transition
+                        self.callbacks(self.prepare_event, event_data)
+                        self.callbacks(transition.prepare, event_data)
+                        if all(condition.check(event_data) for condition in transition.conditions):
+                            return True
         ordered_states = resolve_order(state_tree)
         with self():
             return any(
@@ -776,6 +1260,8 @@ class HierarchicalMachine(Machine):
                                        args, kwargs)
                 state_name = self.state_cls.separator.join(source_path)
                 for transition in self.events[trigger].transitions.get(state_name, []):
+                    if getattr(transition, 'sync', False):
+                        continue
                     try:
                         _ = self.get_state(transition.dest) if transition.dest is not None else transition.source
                     except ValueError:

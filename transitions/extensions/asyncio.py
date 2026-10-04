@@ -157,6 +157,18 @@ class NestedAsyncTransition(AsyncTransition, NestedTransition):
             graph = event_data.machine.model_graphs[id(event_data.model)]
             graph.reset_styling()
             graph.set_previous_transition(self.source, self.dest)
+        if self.sync:
+            state_tree, exit_partials, enter_partials = self._resolve_sync_transition(event_data)
+            for func in exit_partials:
+                await func()
+            self._update_model(event_data, state_tree)
+            for func in enter_partials:
+                await func()
+            with event_data.machine():
+                on_final_cbs, _ = self._final_check(event_data, state_tree, enter_partials)
+                for on_final_cb in on_final_cbs:
+                    await on_final_cb()
+            return
         state_tree, exit_partials, enter_partials = self._resolve_transition(event_data)
         for func in exit_partials:
             await func()
@@ -239,32 +251,76 @@ class NestedAsyncEvent(NestedEvent):
         """
         machine = event_data.machine
         model = event_data.model
-        state_tree = machine.build_state_tree(getattr(model, machine.model_attribute), machine.state_cls.separator)
+        state_tree = machine.build_state_tree(listify(getattr(model, machine.model_attribute)),
+                                              machine.state_cls.separator)
         state_tree = reduce(dict.get, machine.get_global_name(join=False), state_tree)
         ordered_states = resolve_order(state_tree)
         done = set()
+        seen = set()
         event_data.event = self
+        sync_transitions = [trans for candidates in self.transitions.values()
+                            for trans in candidates if getattr(trans, 'sync', False)]
+        sync_candidates = []
+        for trans in sync_transitions:
+            if trans not in seen:
+                seen.add(trans)
+                sync_candidates.append(trans)
+        if sync_candidates:
+            ordered_list = list(ordered_states)
+            first_state = ordered_list[-1] if ordered_list else []
+            await machine.callbacks(machine.prepare_event, event_data)
+            names = [machine.state_cls.separator.join(trans.sources_paths[0])
+                     for trans in sync_candidates]
+            event_data.sync_candidate_names = names
+            event_data.state = machine.get_state(first_state)
+            event_data.source_name = machine.state_cls.separator.join(first_state)
+            event_data.source_path = copy.copy(first_state)
+            event_data.sync_state_tree = state_tree
+            event_data.sync_candidate_transitions = sync_candidates
+            await self._process(event_data)
+            if event_data.result:
+                return True
+            seen.update(sync_candidates)
+        event_data.sync_candidate_transitions = None
         for state_path in ordered_states:
             state_name = machine.state_cls.separator.join(state_path)
             if state_name not in done and state_name in self.transitions:
                 event_data.state = machine.get_state(state_name)
                 event_data.source_name = state_name
                 event_data.source_path = copy.copy(state_path)
+                event_data.sync_state_tree = state_tree
+                event_data.sync_candidate_names = [state_name]
+                event_data.sync_candidate_transitions = None
                 await self._process(event_data)
                 if event_data.result:
-                    elems = state_path
-                    while elems:
-                        done.add(machine.state_cls.separator.join(elems))
-                        elems.pop()
+                    source_paths = event_data.transition.sources_paths \
+                        if getattr(event_data.transition, 'sync', False) else [state_path]
+                    for source_path in source_paths:
+                        elems = copy.copy(source_path)
+                        while elems:
+                            done.add(machine.state_cls.separator.join(elems))
+                            elems.pop()
         return event_data.result
 
     async def _process(self, event_data):
         machine = event_data.machine
-        await machine.callbacks(event_data.machine.prepare_event, event_data)
-        _LOGGER.debug("%sExecuted machine preparation callbacks before conditions.", machine.name)
-
-        for trans in self.transitions[event_data.source_name]:
+        explicit_transitions = getattr(event_data, 'sync_candidate_transitions', None)
+        if explicit_transitions is None:
+            await machine.callbacks(event_data.machine.prepare_event, event_data)
+            _LOGGER.debug("%sExecuted machine preparation callbacks before conditions.", machine.name)
+        if explicit_transitions is not None:
+            transitions = explicit_transitions
+        else:
+            candidate_names = getattr(event_data, 'sync_candidate_names', [event_data.source_name])
+            transitions = [trans for name in candidate_names
+                           for trans in self.transitions.get(name, [])]
+            transitions = [trans for index, trans in enumerate(transitions)
+                           if trans not in transitions[:index]]
+        for trans in transitions:
             event_data.transition = trans
+            if getattr(trans, 'sync', False) and \
+                    not trans.sources_active(event_data.sync_state_tree, machine):
+                continue
             event_data.result = await trans.execute(event_data)
             if event_data.result:
                 break
@@ -588,7 +644,24 @@ class HierarchicalAsyncMachine(HierarchicalMachine, AsyncMachine):
         return None if not res or all(v is None for v in res.values()) else any(res.values())
 
     async def _can_trigger(self, model, trigger, *args, **kwargs):
-        state_tree = self.build_state_tree(getattr(model, self.model_attribute), self.state_cls.separator)
+        state_tree = self.build_state_tree(listify(getattr(model, self.model_attribute)),
+                                           self.state_cls.separator)
+        with self():
+            if trigger in self.events:
+                for transitions in self.events[trigger].transitions.values():
+                    for transition in transitions:
+                        if not getattr(transition, 'sync', False):
+                            continue
+                        if not transition.sources_active(state_tree, self):
+                            continue
+                        event = AsyncEvent(name=trigger, machine=self)
+                        event_data = AsyncEventData(self.get_model_state(model), event, self, model, args, kwargs)
+                        event_data.transition = transition
+                        await self.callbacks(self.prepare_event, event_data)
+                        await self.callbacks(transition.prepare, event_data)
+                        if all(await self.await_all([partial(condition.check, event_data)
+                                                     for condition in transition.conditions])):
+                            return True
         ordered_states = resolve_order(state_tree)
         for state_path in ordered_states:
             with self():
@@ -602,6 +675,8 @@ class HierarchicalAsyncMachine(HierarchicalMachine, AsyncMachine):
                                             model, args, kwargs)
                 state_name = self.state_cls.separator.join(source_path)
                 for transition in self.events[trigger].transitions.get(state_name, []):
+                    if getattr(transition, 'sync', False):
+                        continue
                     try:
                         _ = self.get_state(transition.dest) if transition.dest is not None else transition.source
                     except ValueError:
